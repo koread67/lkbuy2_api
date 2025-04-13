@@ -8,12 +8,9 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
 
     # ✅ 모든 컬럼을 1차원 Series로 강제 변환
     for col in ["Close", "Volume", "High", "Low"]:
-        if isinstance(data[col], pd.DataFrame):
-            data[col] = data[col].iloc[:, 0]
-        elif hasattr(data[col], "values") and data[col].values.ndim == 2:
-            data[col] = pd.Series(data[col].values.squeeze())
+        data[col] = pd.Series(data[col].values.ravel())
 
-    # ADX 계산 (14일)
+    # ADX 계산
     adx_indicator = ta.trend.ADXIndicator(
         high=data["High"],
         low=data["Low"],
@@ -22,7 +19,7 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
     )
     data["ADX"] = adx_indicator.adx()
 
-    # CCI 계산 (20일)
+    # CCI 계산
     cci_indicator = ta.trend.CCIIndicator(
         high=data["High"],
         low=data["Low"],
@@ -38,7 +35,7 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
     )
     data["OBV"] = obv_indicator.on_balance_volume()
 
-    # OBV 추세 계산 (최근 값 - 7일 전)
+    # OBV 추세 계산
     if len(data) >= 8:
         obv_trend = data["OBV"].iloc[-1] - data["OBV"].iloc[-8]
     else:
@@ -53,9 +50,6 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
     }
 
 def generate_signal(indicators: dict, decision: str):
-    """
-    기술적 지표를 바탕으로 매수 또는 매도 신호와 100점 만점의 신뢰도(찬단 강도)를 산출합니다.
-    """
     score = 0
     adx = indicators.get("ADX", 0)
     if adx >= 25:
