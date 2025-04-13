@@ -5,32 +5,42 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
     """
     야후 파이낸스 데이터를 이용해 ADX, CCI, OBV 지표와 OBV 7일 추세를 계산합니다.
     """
-    # ADX 계산 (14일 기간)
+
+    # ADX 계산 (14일)
     adx_indicator = ta.trend.ADXIndicator(
-        high=data["High"], 
-        low=data["Low"], 
-        close=data["Close"], 
+        high=data["High"],
+        low=data["Low"],
+        close=data["Close"],
         window=14
     )
     data["ADX"] = adx_indicator.adx()
-    
-    # CCI 계산 (20일 기간)
+
+    # CCI 계산 (20일)
     cci_indicator = ta.trend.CCIIndicator(
-        high=data["High"], 
-        low=data["Low"], 
-        close=data["Close"], 
+        high=data["High"],
+        low=data["Low"],
+        close=data["Close"],
         window=20
     )
     data["CCI"] = cci_indicator.cci()
-    
-    # OBV 계산 (중요 수정)
+
+    # OBV 계산 (1차원 강제 변환 포함)
+    close = data["Close"]
+    volume = data["Volume"]
+
+    # ✅ 2차원 형태일 경우, 1차원 Series로 강제 변환
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    if isinstance(volume, pd.DataFrame):
+        volume = volume.iloc[:, 0]
+
     obv_indicator = ta.volume.OnBalanceVolumeIndicator(
-        close=data["Close"].squeeze(),
-        volume=data["Volume"].squeeze()
+        close=close,
+        volume=volume
     )
     data["OBV"] = obv_indicator.on_balance_volume()
-    
-    # OBV 추세 계산
+
+    # OBV 추세 계산 (최근 값 - 7일 전)
     if len(data) >= 8:
         obv_trend = data["OBV"].iloc[-1] - data["OBV"].iloc[-8]
     else:
@@ -44,7 +54,11 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
         "OBV_trend": obv_trend
     }
 
+
 def generate_signal(indicators: dict, decision: str):
+    """
+    기술적 지표를 바탕으로 매수 또는 매도 신호와 100점 만점의 신뢰도(찬단 강도)를 산출합니다.
+    """
     score = 0
     adx = indicators.get("ADX", 0)
     if adx >= 25:
@@ -78,4 +92,3 @@ def generate_signal(indicators: dict, decision: str):
 
     recommendation = decision if score >= 80 else ("매도" if decision == "매수" else "매수")
     return recommendation, score
-
