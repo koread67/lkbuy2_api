@@ -6,8 +6,8 @@ from utils import calculate_indicators, generate_signal
 app = FastAPI(title="LKBUY2 API")
 
 class AnalysisRequest(BaseModel):
-    symbol: str         # 예: "AAPL" 또는 "005930.KS"
-    decision: str       # "매수" 또는 "매도"
+    symbol: str
+    decision: str
 
 @app.post("/analyze")
 def analyze_stock(req: AnalysisRequest, request: Request):
@@ -32,7 +32,7 @@ def analyze_stock(req: AnalysisRequest, request: Request):
         }
 
     except HTTPException as e:
-        raise e  # 404는 그대로 전달
+        raise e
     except Exception as e:
         print("❌ 서버 오류 발생:", str(e))
         raise HTTPException(status_code=500, detail=str(e))

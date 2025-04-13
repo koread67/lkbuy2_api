@@ -5,12 +5,9 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
     """
     야후 파이낸스 데이터를 이용해 ADX, CCI, OBV 지표와 OBV 7일 추세를 계산합니다.
     """
-
-    # ✅ 모든 컬럼을 1차원 Series로 강제 변환
     for col in ["Close", "Volume", "High", "Low"]:
-        data[col] = pd.Series(data[col].values.ravel())
+        data[col] = pd.Series(data[col].to_numpy().ravel())
 
-    # ADX 계산
     adx_indicator = ta.trend.ADXIndicator(
         high=data["High"],
         low=data["Low"],
@@ -19,7 +16,6 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
     )
     data["ADX"] = adx_indicator.adx()
 
-    # CCI 계산
     cci_indicator = ta.trend.CCIIndicator(
         high=data["High"],
         low=data["Low"],
@@ -28,14 +24,12 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
     )
     data["CCI"] = cci_indicator.cci()
 
-    # OBV 계산
     obv_indicator = ta.volume.OnBalanceVolumeIndicator(
         close=data["Close"],
         volume=data["Volume"]
     )
     data["OBV"] = obv_indicator.on_balance_volume()
 
-    # OBV 추세 계산
     if len(data) >= 8:
         obv_trend = data["OBV"].iloc[-1] - data["OBV"].iloc[-8]
     else:
@@ -50,6 +44,9 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
     }
 
 def generate_signal(indicators: dict, decision: str):
+    """
+    기술적 지표를 바탕으로 매수 또는 매도 신호와 100점 만점의 신뢰도(찬단 강도)를 산출합니다.
+    """
     score = 0
     adx = indicators.get("ADX", 0)
     if adx >= 25:
