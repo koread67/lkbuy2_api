@@ -6,6 +6,13 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
     야후 파이낸스 데이터를 이용해 ADX, CCI, OBV 지표와 OBV 7일 추세를 계산합니다.
     """
 
+    # ✅ 모든 컬럼을 1차원 Series로 강제 변환
+    for col in ["Close", "Volume", "High", "Low"]:
+        if isinstance(data[col], pd.DataFrame):
+            data[col] = data[col].iloc[:, 0]
+        elif hasattr(data[col], "values") and data[col].values.ndim == 2:
+            data[col] = pd.Series(data[col].squeeze())
+
     # ADX 계산 (14일)
     adx_indicator = ta.trend.ADXIndicator(
         high=data["High"],
@@ -24,23 +31,14 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
     )
     data["CCI"] = cci_indicator.cci()
 
-    # OBV 계산 (1차원 강제 변환 포함)
-    close = data["Close"]
-    volume = data["Volume"]
-
-    # ✅ 2차원 형태일 경우, 1차원 Series로 강제 변환
-    if isinstance(close, pd.DataFrame):
-        close = close.iloc[:, 0]
-    if isinstance(volume, pd.DataFrame):
-        volume = volume.iloc[:, 0]
-
+    # OBV 계산
     obv_indicator = ta.volume.OnBalanceVolumeIndicator(
-        close=close,
-        volume=volume
+        close=data["Close"],
+        volume=data["Volume"]
     )
     data["OBV"] = obv_indicator.on_balance_volume()
 
-    # OBV 추세 계산 (최근 값 - 7일 전)
+    # OBV 추세 계산 (최근값 - 7일 전)
     if len(data) >= 8:
         obv_trend = data["OBV"].iloc[-1] - data["OBV"].iloc[-8]
     else:
