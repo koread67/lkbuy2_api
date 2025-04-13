@@ -11,7 +11,7 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
         if isinstance(data[col], pd.DataFrame):
             data[col] = data[col].iloc[:, 0]
         elif hasattr(data[col], "values") and data[col].values.ndim == 2:
-            data[col] = pd.Series(data[col].squeeze())
+            data[col] = pd.Series(data[col].values.squeeze())
 
     # ADX 계산 (14일)
     adx_indicator = ta.trend.ADXIndicator(
@@ -38,7 +38,7 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
     )
     data["OBV"] = obv_indicator.on_balance_volume()
 
-    # OBV 추세 계산 (최근값 - 7일 전)
+    # OBV 추세 계산 (최근 값 - 7일 전)
     if len(data) >= 8:
         obv_trend = data["OBV"].iloc[-1] - data["OBV"].iloc[-8]
     else:
@@ -51,7 +51,6 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
         "OBV": latest["OBV"],
         "OBV_trend": obv_trend
     }
-
 
 def generate_signal(indicators: dict, decision: str):
     """

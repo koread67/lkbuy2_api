@@ -1,6 +1,5 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
-import uvicorn
 import yfinance as yf
 from utils import calculate_indicators, generate_signal
 
@@ -11,31 +10,33 @@ class AnalysisRequest(BaseModel):
     decision: str       # "매수" 또는 "매도"
 
 @app.post("/analyze")
-def analyze_stock(req: AnalysisRequest):
+def analyze_stock(req: AnalysisRequest, request: Request):
     try:
-        # 야후 파이낸스에서 최근 3개월치 일봉 데이터 다운로드
+        print(f"✅ 요청 받음: symbol={req.symbol}, decision={req.decision}")
+
         data = yf.download(req.symbol, period="3mo", interval="1d")
+        print("📊 데이터 다운로드 완료:", data.shape)
+
         if data.empty:
             raise HTTPException(status_code=404, detail="종목을 찾을 수 없거나 데이터가 없습니다.")
 
-        # 기술적 지표 계산 (ADX, CCI, OBV 및 OBV 추세)
         indicators = calculate_indicators(data)
-        # 계산된 지표를 기반으로 요청한 판단(매수/매도)과 신뢰도 점수를 산출
         recommendation, conviction_score = generate_signal(indicators, req.decision)
-        
-        result = {
+
+        return {
             "symbol": req.symbol,
             "decision_requested": req.decision,
             "recommendation": recommendation,
             "conviction_score": round(conviction_score, 2),
             "indicators": indicators
         }
-        return result
+
+    except HTTPException as e:
+        raise e  # 404는 그대로 전달
     except Exception as e:
+        print("❌ 서버 오류 발생:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
 @app.get("/")
-def home():
+def root():
     return {"message": "LKBUY2 API is running"}
