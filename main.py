@@ -34,19 +34,22 @@ def analyze_stock(req: AnalysisRequest, request: Request):
         indicators = calculate_indicators(data)
         result = generate_signal(indicators, req.decision)
 
+        score = float(result["score"]) if result.get("score") is not None else None
+        level = str(result["level"]) if result.get("level") else ""
+
         response = {
             "symbol": req.symbol,
             "decision_requested": req.decision,
-            "recommendation": str(result["recommendation"]),
-            "conviction_score": float(result["score"]),
-            "strength_level": str(result["level"]) if result.get("level") else "해당없음",
-            "color": result["color"],
-            "reason": str(result["reason"]),
+            "recommendation": str(result.get("recommendation", "분석불가")),
+            "conviction_score": score,
+            "strength_level": level,
+            "color": result.get("color", "#888888"),
+            "reason": str(result.get("reason", "분석 결과 없음")),
             "indicators": {
-                "CCI": float(indicators["CCI"]),
-                "OBV": float(indicators["OBV"]),
-                "OBV_trend": float(indicators["OBV_trend"]),
-                "RSI": float(indicators["RSI"]),
+                "CCI": float(indicators.get("CCI", 0)),
+                "OBV": float(indicators.get("OBV", 0)),
+                "OBV_trend": float(indicators.get("OBV_trend", 0)),
+                "RSI": float(indicators.get("RSI", 0)),
             }
         }
 
