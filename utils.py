@@ -41,6 +41,7 @@ def generate_signal(indicators: dict, decision: str):
         obv_score = 30 if obv_trend < 0 else 10
         rsi_score = 30 if rsi > 70 else 10
 
+    # 이유 설명
     if decision == "매수":
         reasons.append("CCI가 과매도 구간입니다." if cci < -100 else "CCI가 과매도 구간이 아닙니다.")
         reasons.append("OBV가 상승세로 자금 유입 신호입니다." if obv_trend > 0 else "OBV가 하락세로 자금 유출 신호입니다.")
@@ -50,16 +51,14 @@ def generate_signal(indicators: dict, decision: str):
         reasons.append("OBV가 하락세로 자금 이탈 신호입니다." if obv_trend < 0 else "OBV가 상승세로 자금 유입 신호입니다.")
         reasons.append("RSI가 70 이상으로 과매수 구간입니다." if rsi > 70 else "RSI가 과매수 구간이 아닙니다.")
 
-    if decision == "매수":
-        score = round(cci_score * 0.50 + obv_score * 0.30 + rsi_score * 0.20)
-    else:
-        score = round(cci_score * 0.20 + obv_score * 0.35 + rsi_score * 0.45)
+    score = round(cci_score * 0.45 + obv_score * 0.35 + rsi_score * 0.20)
 
     if decision == "매수":
         recommendation = "매수" if score >= 80 else "매수X"
     else:
         recommendation = "매도" if score >= 80 else "매도X"
 
+    # 색상 및 레벨
     if score >= 80:
         color = "#4CAF50"
         level = "매우 강함"

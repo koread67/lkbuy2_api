@@ -34,8 +34,17 @@ def analyze_stock(req: AnalysisRequest, request: Request):
         indicators = calculate_indicators(data)
         result = generate_signal(indicators, req.decision)
 
-        score = float(result["score"]) if result.get("score") is not None else None
-        level = str(result["level"]) if result.get("level") else ""
+        score = result.get("score")
+        level = result.get("level")
+
+        # 예외 없이 숫자/문자 형태로 반환되도록 보장
+        try:
+            score = float(score)
+        except:
+            score = 0.0
+
+        if not isinstance(level, str):
+            level = "해당없음"
 
         response = {
             "symbol": req.symbol,
