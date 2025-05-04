@@ -7,9 +7,8 @@ import requests
 import pandas as pd
 import traceback
 
-app = FastAPI(title="LKBUY2 API - AlphaVantage Edition")
+app = FastAPI(title="LKBUY2 API - Alpha + KRX Fallback")
 
-# ✅ CORS 설정
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,11 +20,11 @@ app.add_middleware(
 API_KEY = "2QD3PFZE54GZO088"
 
 class AnalysisRequest(BaseModel):
-    symbol: str
+    symbol: str  # 종목 코드 또는 심볼 (예: AAPL, 069500)
     decision: str
 
 def fetch_indicator(symbol, function, extra_params):
-    base_url = "https://www.alphavantage.co/query"
+    url = "https://www.alphavantage.co/query"
     params = {
         "function": function,
         "symbol": symbol,
@@ -33,36 +32,83 @@ def fetch_indicator(symbol, function, extra_params):
         "interval": "daily"
     }
     params.update(extra_params)
-    response = requests.get(base_url, params=params)
+    response = requests.get(url, params=params)
     return response.json()
 
+def fetch_krx_etf_data(etf_code):
+    try:
+        url = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        data = {
+            "bld": "dbms/MDC/STAT/standard/MDCSTAT01701",
+            "mktId": "ETF",
+            "etfTab": "1",
+            "code": etf_code
+        }
+        response = requests.post(url, data=data, headers=headers)
+        result = response.json()
+        df = pd.DataFrame(result["output"])
+        df["종가"] = pd.to_numeric(df["종가"].str.replace(",", ""), errors="coerce")
+        df["일자"] = pd.to_datetime(df["일자"])
+        df = df.sort_values("일자")
+        return df
+    except Exception as e:
+        print("❌ KRX ETF fallback 실패:", e)
+        return None
+
 def calculate_indicators(symbol):
-    cci_data = fetch_indicator(symbol, "CCI", {"time_period": 20})
-    cci_series = cci_data.get("Technical Analysis: CCI", {})
+    try:
+        cci_data = fetch_indicator(symbol, "CCI", {"time_period": 20})
+        obv_data = fetch_indicator(symbol, "OBV", {})
+        rsi_data = fetch_indicator(symbol, "RSI", {"time_period": 14, "series_type": "close"})
 
-    obv_data = fetch_indicator(symbol, "OBV", {})
-    obv_series = obv_data.get("Technical Analysis: OBV", {})
+        cci_series = cci_data.get("Technical Analysis: CCI", {})
+        obv_series = obv_data.get("Technical Analysis: OBV", {})
+        rsi_series = rsi_data.get("Technical Analysis: RSI", {})
 
-    rsi_data = fetch_indicator(symbol, "RSI", {"time_period": 14, "series_type": "close"})
-    rsi_series = rsi_data.get("Technical Analysis: RSI", {})
+        df = pd.DataFrame({
+            "CCI": {d: float(v["CCI"]) for d, v in cci_series.items()},
+            "OBV": {d: float(v["OBV"]) for d, v in obv_series.items()},
+            "RSI": {d: float(v["RSI"]) for d, v in rsi_series.items()},
+        }).sort_index(ascending=True)
 
-    df = pd.DataFrame({
-        "CCI": {date: float(val["CCI"]) for date, val in cci_series.items()},
-        "OBV": {date: float(val["OBV"]) for date, val in obv_series.items()},
-        "RSI": {date: float(val["RSI"]) for date, val in rsi_series.items()},
-    }).sort_index(ascending=True)
+        if df is None or df.empty or len(df) < 2:
+            raise ValueError("Alpha Vantage 데이터 부족")
 
-    latest = df.iloc[-1]
-    prev = df.iloc[-8] if len(df) >= 8 else df.iloc[-2]
+        latest = df.iloc[-1]
+        prev = df.iloc[-8] if len(df) >= 8 else df.iloc[-2]
+        obv_trend = latest["OBV"] - prev["OBV"]
 
-    obv_trend = latest["OBV"] - prev["OBV"]
+        return {
+            "CCI": latest["CCI"],
+            "OBV": latest["OBV"],
+            "OBV_trend": obv_trend,
+            "RSI": latest["RSI"]
+        }
 
-    return {
-        "CCI": latest["CCI"],
-        "OBV": latest["OBV"],
-        "OBV_trend": obv_trend,
-        "RSI": latest["RSI"]
-    }
+    except Exception as e:
+        print("⚠️ Alpha 실패, KRX fallback 시도")
+        df = fetch_krx_etf_data(symbol)
+        if df is None or df.empty or len(df) < 10:
+            raise ValueError("Alpha/KRX 모두 실패")
+
+        close = df["종가"]
+        high = close.rolling(2).max()
+        low = close.rolling(2).min()
+        volume = pd.Series([1000000] * len(close))  # KRX는 거래량 제공 안 함: 임시값
+
+        import ta
+        cci = ta.trend.CCIIndicator(high=high, low=low, close=close, window=20).cci().iloc[-1]
+        obv = ta.volume.OnBalanceVolumeIndicator(close=close, volume=volume).on_balance_volume()
+        rsi = ta.momentum.RSIIndicator(close=close, window=14).rsi().iloc[-1]
+        obv_trend = obv.iloc[-1] - obv.iloc[-8] if len(obv) >= 8 else 0
+
+        return {
+            "CCI": cci,
+            "OBV": obv.iloc[-1],
+            "OBV_trend": obv_trend,
+            "RSI": rsi,
+        }
 
 def generate_signal(indicators: dict, decision: str):
     cci = indicators.get("CCI", 0)
@@ -120,30 +166,22 @@ def generate_signal(indicators: dict, decision: str):
 @app.post("/analyze")
 def analyze_stock(req: AnalysisRequest, request: Request):
     try:
-        print(f"✅ 요청 받음: symbol={req.symbol}, decision={req.decision}")
         indicators = calculate_indicators(req.symbol)
         result = generate_signal(indicators, req.decision)
-
-        response = {
+        return JSONResponse(content={
             "symbol": req.symbol,
             "decision_requested": req.decision,
-            "recommendation": str(result["recommendation"]),
-            "conviction_score": float(result["score"]),
-            "strength_level": str(result["level"]),
+            "recommendation": result["recommendation"],
+            "conviction_score": result["score"],
+            "strength_level": result["level"],
             "color": result["color"],
-            "reason": str(result["reason"]),
+            "reason": result["reason"],
             "indicators": indicators
-        }
-
-        return JSONResponse(content=response, media_type="application/json; charset=utf-8")
-
-    except HTTPException as e:
-        raise e
+        }, media_type="application/json; charset=utf-8")
     except Exception as e:
-        print("❌ 서버 오류 발생:", str(e))
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 def root():
-    return {"message": "LKBUY2 API with Alpha Vantage is running"}
+    return {"message": "LKBUY2 API (Alpha + KRX fallback) is running"}
