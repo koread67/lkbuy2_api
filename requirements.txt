@@ -1,5 +1,8 @@
 fastapi
 uvicorn
-pandas
+pydantic
 requests
+pandas
 ta
+lxml
+beautifulsoup4

@@ -3,11 +3,16 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from utils import calculate_indicators, generate_signal
+import traceback
 import requests
 import pandas as pd
-import traceback
+from io import StringIO
+import math
 
-app = FastAPI(title="LKBUY2 API - Alpha Only with Stock Not Found Message")
+ALPHA_VANTAGE_API_KEY = "2QD3PFZE54GZO088"
+
+app = FastAPI(title="LKBUY2 API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,128 +22,119 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-API_KEY = "2QD3PFZE54GZO088"
-
 class AnalysisRequest(BaseModel):
     symbol: str
     decision: str
 
-def fetch_indicator(symbol, function, extra_params):
-    url = "https://www.alphavantage.co/query"
-    params = {
-        "function": function,
-        "symbol": symbol,
-        "apikey": API_KEY,
-        "interval": "daily"
-    }
-    params.update(extra_params)
-    response = requests.get(url, params=params)
-    return response.json()
+def safe_float(value):
+    return float(value) if value is not None and math.isfinite(value) else 0.0
 
-def calculate_indicators(symbol):
-    cci_data = fetch_indicator(symbol, "CCI", {"time_period": 20})
-    obv_data = fetch_indicator(symbol, "OBV", {})
-    rsi_data = fetch_indicator(symbol, "RSI", {"time_period": 14, "series_type": "close"})
+def fetch_from_alpha_vantage(symbol: str):
+    try:
+        url = "https://www.alphavantage.co/query"
+        params = {
+            "function": "TIME_SERIES_DAILY",
+            "symbol": symbol,
+            "apikey": ALPHA_VANTAGE_API_KEY,
+            "outputsize": "compact"
+        }
+        response = requests.get(url, params=params)
+        print(f"🔍 Alpha 요청 URL: {response.url}")
+        if response.status_code != 200:
+            print(f"❌ Alpha 요청 실패 (status: {response.status_code})")
+            return None
+        data = response.json()
+        if "Time Series (Daily)" not in data:
+            print("❌ Alpha 응답에 Time Series 없음:", data)
+            return None
 
-    cci_series = cci_data.get("Technical Analysis: CCI", {})
-    obv_series = obv_data.get("Technical Analysis: OBV", {})
-    rsi_series = rsi_data.get("Technical Analysis: RSI", {})
+        df = pd.DataFrame(data["Time Series (Daily)"]).T
+        df = df.astype(float)
+        df = df.rename(columns={
+            "1. open": "Open", "2. high": "High", "3. low": "Low",
+            "4. close": "Close", "5. volume": "Volume"
+        })[["Open", "High", "Low", "Close", "Volume"]]
+        return df.tail(90)
+    except Exception as e:
+        print("❌ Alpha 처리 중 오류:", e)
+        return None
 
-    if not cci_series or not obv_series or not rsi_series:
-        raise ValueError("종목이 없거나 데이터를 가져올 수 없습니다.")
+def fetch_from_krx(symbol: str, pages: int = 5):
+    try:
+        symbol = symbol.zfill(6)
+        headers = {
+            "User-Agent": "Mozilla/5.0"
+        }
+        all_dfs = []
+        for page in range(1, pages + 1):
+            url = f"https://finance.naver.com/item/sise_day.nhn?code={symbol}&page={page}"
+            print(f"📡 KRX 요청 중 (p{page}): {url}")
+            response = requests.get(url, headers=headers)
+            dfs = pd.read_html(StringIO(response.text), header=0)
+            if dfs:
+                all_dfs.append(dfs[0])
+        df = pd.concat(all_dfs)
+        print(f"📋 누적 수집된 DataFrame 크기 (raw): {df.shape}")
 
-    df = pd.DataFrame({
-        "CCI": {d: float(v["CCI"]) for d, v in cci_series.items()},
-        "OBV": {d: float(v["OBV"]) for d, v in obv_series.items()},
-        "RSI": {d: float(v["RSI"]) for d, v in rsi_series.items()},
-    }).sort_index(ascending=True)
-
-    if df is None or df.empty or len(df) < 2:
-        raise ValueError("종목이 없거나 데이터를 가져올 수 없습니다.")
-
-    latest = df.iloc[-1]
-    prev = df.iloc[-8] if len(df) >= 8 else df.iloc[-2]
-    obv_trend = latest["OBV"] - prev["OBV"]
-
-    return {
-        "CCI": latest["CCI"],
-        "OBV": latest["OBV"],
-        "OBV_trend": obv_trend,
-        "RSI": latest["RSI"]
-    }
-
-def generate_signal(indicators: dict, decision: str):
-    cci = indicators.get("CCI", 0)
-    obv_trend = indicators.get("OBV_trend", 0)
-    rsi = indicators.get("RSI", 0)
-
-    reasons = []
-
-    if decision == "매수":
-        cci_score = 40 if cci < -100 else 10
-        obv_score = 30 if obv_trend > 0 else 10
-        rsi_score = 30 if rsi < 30 else 10
-    else:
-        cci_score = 40 if cci > 100 else 10
-        obv_score = 30 if obv_trend < 0 else 10
-        rsi_score = 30 if rsi > 70 else 10
-
-    if decision == "매수":
-        reasons.append("CCI가 과매도 구간입니다." if cci < -100 else "CCI가 과매도 구간이 아닙니다.")
-        reasons.append("OBV가 상승세로 자금 유입 신호입니다." if obv_trend > 0 else "OBV가 하락세로 자금 유출 신호입니다.")
-        reasons.append("RSI가 30 이하로 과매도 구간입니다." if rsi < 30 else "RSI가 과매도 구간이 아닙니다.")
-    else:
-        reasons.append("CCI가 과매수 구간입니다." if cci > 100 else "CCI가 과매수 구간이 아닙니다.")
-        reasons.append("OBV가 하락세로 자금 이탈 신호입니다." if obv_trend < 0 else "OBV가 상승세로 자금 유입 신호입니다.")
-        reasons.append("RSI가 70 이상으로 과매수 구간입니다." if rsi > 70 else "RSI가 과매수 구간이 아닙니다.")
-
-    score = round(cci_score * 0.45 + obv_score * 0.35 + rsi_score * 0.20)
-
-    if decision == "매수":
-        recommendation = "매수" if score >= 80 else "매수X"
-    else:
-        recommendation = "매도" if score >= 80 else "매도X"
-
-    if score >= 80:
-        color = "#4CAF50"
-        level = "매우 강함"
-    elif score >= 60:
-        color = "#FFEB3B"
-        level = "보통"
-    elif score >= 40:
-        color = "#FF9800"
-        level = "약함"
-    else:
-        color = "#F44336"
-        level = "매수X" if decision == "매수" else "매도X"
-
-    return {
-        "recommendation": recommendation,
-        "score": score,
-        "color": color,
-        "level": level,
-        "reason": " ".join(reasons)
-    }
+        df = df.dropna(how="all")
+        df = df.rename(columns={"종가": "Close", "거래량": "Volume", "고가": "High", "저가": "Low"})
+        df["Close"] = df["Close"].astype(str).str.replace(",", "").astype(float)
+        df["Volume"] = df["Volume"].astype(str).str.replace(",", "").astype(float)
+        df["High"] = df["High"].astype(str).str.replace(",", "").astype(float)
+        df["Low"] = df["Low"].astype(str).str.replace(",", "").astype(float)
+        df["Open"] = df[["Close", "High", "Low"]].mean(axis=1)
+        result = df.iloc[::-1].reset_index(drop=True)
+        print(f"✅ 정제된 DataFrame 크기: {result.shape}")
+        return result
+    except Exception as e:
+        print("❌ KRX 다중 페이지 파싱 실패:", e)
+        return None
 
 @app.post("/analyze")
 def analyze_stock(req: AnalysisRequest, request: Request):
     try:
-        indicators = calculate_indicators(req.symbol)
+        print(f"✅ 요청 받음: symbol={req.symbol}, decision={req.decision}")
+        data = fetch_from_alpha_vantage(req.symbol)
+
+        if data is None or data.empty:
+            if req.symbol.isdigit() and len(req.symbol.zfill(6)) == 6:
+                print("⚠️ Alpha 실패, 숫자형 종목으로 KRX 시도")
+                data = fetch_from_krx(req.symbol, pages=5)
+            else:
+                print("🚫 Alpha 실패 + KRX 우회 차단 (비숫자 종목코드)")
+
+        if data is None or data.empty:
+            return JSONResponse(
+                content={"symbol": req.symbol, "message": "검출안됨"},
+                media_type="application/json; charset=utf-8",
+                status_code=404
+            )
+
+        indicators = calculate_indicators(data)
         result = generate_signal(indicators, req.decision)
-        return JSONResponse(content={
+
+        response = {
             "symbol": req.symbol,
             "decision_requested": req.decision,
-            "recommendation": result["recommendation"],
-            "conviction_score": result["score"],
-            "strength_level": result["level"],
+            "recommendation": str(result["recommendation"]),
+            "conviction_score": safe_float(result["score"]),
+            "strength_level": str(result["level"]),
             "color": result["color"],
-            "reason": result["reason"],
-            "indicators": indicators
-        }, media_type="application/json; charset=utf-8")
+            "reason": str(result["reason"]),
+            "indicators": {
+                "CCI": safe_float(indicators["CCI"]),
+                "OBV": safe_float(indicators["OBV"]),
+                "OBV_trend": safe_float(indicators["OBV_trend"]),
+                "RSI": safe_float(indicators["RSI"]),
+            }
+        }
+
+        return JSONResponse(content=response, media_type="application/json; charset=utf-8")
     except Exception as e:
+        print("❌ 서버 오류:", str(e))
         traceback.print_exc()
-        raise HTTPException(status_code=404, detail="종목이 없거나 데이터를 가져올 수 없습니다.")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 def root():
-    return {"message": "LKBUY2 API (Alpha Only) is running"}
+    return {"message": "LKBUY2 API is running"}
