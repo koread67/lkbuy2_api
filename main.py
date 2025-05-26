@@ -118,7 +118,7 @@ def analyze_stock(req: AnalysisRequest, request: Request):
             "decision_requested": req.decision,
             "recommendation": str(result["recommendation"]),
             "conviction_score": safe_float(result["score"]),
-            "strength_level": str(result["level"]),
+            "strength_level": safe_float(result["strength"]),
             "color": result["color"],
             "reason": str(result["reason"]),
             "indicators": {
