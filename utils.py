@@ -3,6 +3,7 @@ import pandas as pd
 import ta
 import requests
 from bs4 import BeautifulSoup
+from io import StringIO
 
 KOREA_ETF_CODES = [
     "069500", "102110", "114800", "117700", "118260", "122630", "139260", "157450",
@@ -31,7 +32,7 @@ def get_naver_etf_price(code: str, pages: int = 5):
         df_all = df_all.sort_values('Date')
         df_all.set_index('Date', inplace=True)
         return df_all[['Open', 'High', 'Low', 'Close', 'Volume']]
-    except:
+    except Exception:
         return None
 
 def calculate_indicators(data: pd.DataFrame) -> dict:
@@ -39,69 +40,97 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
     volume = pd.Series(data["Volume"].to_numpy().ravel())
     high = pd.Series(data["High"].to_numpy().ravel())
     low = pd.Series(data["Low"].to_numpy().ravel())
+
     cci_indicator = ta.trend.CCIIndicator(high=high, low=low, close=close, window=20)
     cci = cci_indicator.cci()
     obv_indicator = ta.volume.OnBalanceVolumeIndicator(close=close, volume=volume)
     obv = obv_indicator.on_balance_volume()
     rsi_indicator = ta.momentum.RSIIndicator(close=close, window=14)
     rsi = rsi_indicator.rsi()
+
     obv_trend = obv.iloc[-1] - obv.iloc[-8] if len(obv) >= 8 else 0
     return {
-        "CCI": cci.iloc[-1],
-        "OBV": obv.iloc[-1],
-        "OBV_trend": obv_trend,
-        "RSI": rsi.iloc[-1],
+        "CCI": float(cci.iloc[-1]),
+        "OBV": float(obv.iloc[-1]),
+        "OBV_trend": float(obv_trend),
+        "RSI": float(rsi.iloc[-1]),
     }
+
+# ====== 최적조합 반영 로직 ======
+W_CCI = 0.33
+W_RSI = 0.33
+W_OBV = 0.34
+
+BUY_THRESHOLD = 50    # 강매수 임계값
+SELL_THRESHOLD = 90   # 강매도 임계값
+
+def _scale_linear(x, x0, x1, y0=0.0, y1=100.0):
+    if x0 == x1:
+        return (y0 + y1) / 2.0
+    if x <= min(x0, x1):
+        return y0 if x0 < x1 else y1
+    if x >= max(x0, x1):
+        return y1 if x0 < x1 else y0
+    return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+
+def _component_scores_for_buy(cci, rsi, obv_trend):
+    cci_s = _scale_linear(cci, -100, 100, 100, 0)   # 과매도일수록 가산
+    rsi_s = _scale_linear(rsi, 30, 70, 100, 0)      # 30 이하 우수
+    obv_s = 100 if obv_trend > 0 else (0 if obv_trend < 0 else 50)
+    return cci_s, rsi_s, obv_s
+
+def _component_scores_for_sell(cci, rsi, obv_trend):
+    cci_s = _scale_linear(cci, -100, 100, 0, 100)   # 과매수일수록 가산
+    rsi_s = _scale_linear(rsi, 30, 70, 0, 100)      # 70 이상 우수
+    obv_s = 100 if obv_trend < 0 else (0 if obv_trend > 0 else 50)
+    return cci_s, rsi_s, obv_s
 
 def generate_signal(indicators: dict, decision: str):
-    cci = indicators.get("CCI", 0)
-    obv_trend = indicators.get("OBV_trend", 0)
-    rsi = indicators.get("RSI", 0)
-    reasons = []
-    if decision == "매수":
-        cci_score = 40 if cci < -100 else 10
-        obv_score = 30 if obv_trend > 0 else 10
-        rsi_score = 30 if rsi < 30 else 10
-    else:
-        cci_score = 40 if cci > 100 else 10
-        obv_score = 30 if obv_trend < 0 else 10
-        rsi_score = 30 if rsi > 70 else 10
-    if decision == "매수":
-        reasons.append("CCI가 과매도 구간입니다." if cci < -100 else "CCI가 과매도 구간이 아닙니다.")
-        reasons.append("OBV가 상승세로 자금 유입 신호입니다." if obv_trend > 0 else "OBV가 하락세로 자금 유출 신호입니다.")
-        reasons.append("RSI가 30 이하로 과매도 구간입니다." if rsi < 30 else "RSI가 과매도 구간이 아닙니다.")
-    else:
-        reasons.append("CCI가 과매수 구간입니다." if cci > 100 else "CCI가 과매수 구간이 아닙니다.")
-        reasons.append("OBV가 하락세로 자금 이탈 신호입니다." if obv_trend < 0 else "OBV가 상승세로 자금 유입 신호입니다.")
-        reasons.append("RSI가 70 이상으로 과매수 구간입니다." if rsi > 70 else "RSI가 과매수 구간이 아닙니다.")
-    
-    score = round(cci_score * 0.4 + obv_score * 0.3 + rsi_score * 0.3)
-    strength = round(obv_score * 0.6 + cci_score * 0.4)
+    cci = indicators.get("CCI", 0.0)
+    obv_trend = indicators.get("OBV_trend", 0.0)
+    rsi = indicators.get("RSI", 0.0)
 
     if decision == "매수":
-        recommendation = "매수" if score >= 80 else "매수X"
-    else:
-        recommendation = "매도" if score >= 80 else "매도X"
+        cci_s, rsi_s, obv_s = _component_scores_for_buy(cci, rsi, obv_trend)
+        score_f = W_CCI * cci_s + W_RSI * rsi_s + W_OBV * obv_s
+        recommendation = "매수" if score_f >= BUY_THRESHOLD else "매수X"
+        if score_f >= 90:
+            level, color = "매우 강함", "#2E7D32"
+        elif score_f >= 70:
+            level, color = "강함", "#4CAF50"
+        elif score_f >= 50:
+            level, color = "보통", "#FFEB3B"
+        else:
+            level, color = "약함", "#F44336"
+        reasons = [
+            ("CCI 과매도" if cci <= -100 else "CCI 중립" if -100 < cci < 100 else "CCI 과매수 구간"),
+            ("OBV 상승(유입)" if obv_trend > 0 else "OBV 정체" if obv_trend == 0 else "OBV 하락(이탈)"),
+            ("RSI 과매도(≤30)" if rsi <= 30 else "RSI 중립(30~70)" if 30 < rsi < 70 else "RSI 과매수(≥70)"),
+        ]
+    else:  # 매도
+        cci_s, rsi_s, obv_s = _component_scores_for_sell(cci, rsi, obv_trend)
+        score_f = W_CCI * cci_s + W_RSI * rsi_s + W_OBV * obv_s
+        recommendation = "매도" if score_f >= SELL_THRESHOLD else "매도X"
+        if score_f >= 90:
+            level, color = "매우 강함", "#B71C1C"
+        elif score_f >= 70:
+            level, color = "강함", "#E53935"
+        elif score_f >= 50:
+            level, color = "보통", "#FF9800"
+        else:
+            level, color = "약함", "#9E9E9E"
+        reasons = [
+            ("CCI 과매수" if cci >= 100 else "CCI 중립" if -100 < cci < 100 else "CCI 과매도 구간"),
+            ("OBV 하락(이탈)" if obv_trend < 0 else "OBV 정체" if obv_trend == 0 else "OBV 상승(유입)"),
+            ("RSI 과매수(≥70)" if rsi >= 70 else "RSI 중립(30~70)" if 30 < rsi < 70 else "RSI 과매도(≤30)"),
+        ]
 
-    if strength >= 80:
-        color = "#4CAF50"
-        level = "매우 강함"
-    elif strength >= 60:
-        color = "#FFEB3B"
-        level = "보통"
-    elif strength >= 40:
-        color = "#FF9800"
-        level = "약함"
-    else:
-        color = "#F44336"
-        level = "매수X" if decision == "매수" else "매도X"
-
+    score_int = int(round(score_f))
     return {
         "recommendation": recommendation,
-        "score": score,
-        "strength": strength,
+        "score": score_int,
+        "strength": score_int,
         "color": color,
         "level": level,
-        "reason": " ".join(reasons)
+        "reason": " / ".join(reasons)
     }
-
