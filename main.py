@@ -1,5 +1,5 @@
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -8,13 +8,15 @@ import requests
 from io import StringIO
 from datetime import datetime
 import math
+import time
 
 # === utils.py hooks ===
 from utils import calculate_indicators, generate_signal
 
-ALPHA_VANTAGE_API_KEY = "2QD3PFZE54GZO088"
+# === Use Finnhub (user-provided key) ===
+FINNHUB_API_KEY = "d2jqag1r01qj8a5kmhigd2jqag1r01qj8a5kmhj0"
 
-app = FastAPI(title="LKBUY2 API (render-fix)")
+app = FastAPI(title="LKBUY2 API (finnhub)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -57,31 +59,41 @@ def fetch_from_yahoo(symbol: str):
         print("Yahoo fetch fail:", e)
         return None
 
-def fetch_from_alpha_vantage(symbol: str):
+def fetch_from_finnhub(symbol: str):
+    """
+    Daily OHLCV from Finnhub /stock/candle (resolution=D)
+    """
     try:
-        url = "https://www.alphavantage.co/query"
+        url = "https://finnhub.io/api/v1/stock/candle"
+        now = int(time.time())
+        past = now - 60*60*24*220  # ~220 days window
         params = {
-            "function": "TIME_SERIES_DAILY",
             "symbol": symbol,
-            "apikey": ALPHA_VANTAGE_API_KEY,
-            "outputsize": "compact"
+            "resolution": "D",
+            "from": past,
+            "to": now,
+            "token": FINNHUB_API_KEY
         }
-        r = requests.get(url, params=params, timeout=15)
+        r = requests.get(url, params=params, timeout=20)
         data = r.json()
-        ts = data.get("Time Series (Daily)")
-        if not ts:
-            print("Alpha response has no TS:", list(data.keys()))
+        # Expected response has s == "ok"
+        if data.get("s") != "ok":
+            print("Finnhub response:", data)
             return None
-        df = pd.DataFrame(ts).T.astype(float)
-        df = df.rename(columns={
-            "1. open": "Open", "2. high": "High", "3. low": "Low",
-            "4. close": "Close", "5. volume": "Volume"
-        })[["Open","High","Low","Close","Volume"]]
-        df = df.iloc[::-1].reset_index(drop=False).rename(columns={"index":"Date"})
-        df["Date"] = pd.to_datetime(df["Date"])
+        df = pd.DataFrame({
+            "Date": pd.to_datetime(data.get("t", []), unit="s"),
+            "Open": data.get("o", []),
+            "High": data.get("h", []),
+            "Low": data.get("l", []),
+            "Close": data.get("c", []),
+            "Volume": data.get("v", [])
+        })
+        if df.empty:
+            return None
+        df = df.dropna().sort_values("Date").reset_index(drop=True)
         return df.tail(120)
     except Exception as e:
-        print("Alpha fetch fail:", e)
+        print("Finnhub fetch fail:", e)
         return None
 
 def fetch_from_krx_naver(code: str, pages: int = 5):
@@ -131,14 +143,14 @@ def analyze(req: AnalysisRequest):
         df = fetch_from_krx_naver(symbol)
         source = "krx_naver"
 
-    # Overseas / non-numeric -> Yahoo first, then Alpha
+    # Overseas / non-numeric -> Yahoo first, then Finnhub
     if df is None and not symbol.isdigit():
         df = fetch_from_yahoo(symbol)
         source = "yahoo" if df is not None else None
     if df is None:
-        df = fetch_from_alpha_vantage(symbol)
+        df = fetch_from_finnhub(symbol)
         if df is not None:
-            source = "alpha_vantage"
+            source = "finnhub"
 
     if df is None or df.empty:
         return JSONResponse({"symbol": symbol, "message": "데이터 없음 또는 제공처 제한", "source": source}, status_code=404)
