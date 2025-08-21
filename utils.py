@@ -1,22 +1,22 @@
-# -*- coding: utf-8 -*-
-"""
-utils_tuned.py
-- 목표: '1년에 10회 내외'의 매매 빈도를 기본 프로파일로 달성하도록 로직 민감도 상향
-- 변경점
-  1) 지표 기간: CCI=14, RSI=9, OBV_DIFF=2 (단기 반응 ↑)
-  2) OBV를 연속 점수(0~100)로 변환하여 경계 근처에서도 신호가 더 자주 발생
-  3) 기본 임계값: BUY=50, SELL=80 (히스테리시스 보장: BUY < SELL)
-  4) generate_signal()은 기존 출력키를 그대로 유지 (recommendation/score/strength/color/level/reason)
-"""
+
+# trade_decider_v2.py
+# 매매판별 2.0 (English filename for download)
+# - Implements "최적조합" weighted scoring (CCI, RSI, OBV)
+# - Strength is reported as 0~100%: below min-threshold -> 0%, between min~max -> 1~100%
+# - Keeps generate_signal(indicators, decision) signature for drop-in use
+from __future__ import annotations
+
+from dataclasses import dataclass
+from io import StringIO
+from typing import Dict, Optional
 
 import pandas as pd
-import ta
 import requests
+import ta
 from bs4 import BeautifulSoup
-from io import StringIO
-import numpy as np
 
-# ======================== 기본 설정 ========================
+
+# === Constants ===
 KOREA_ETF_CODES = [
     "069500", "102110", "114800", "117700", "118260", "122630", "139260", "157450",
     "214980", "219480", "229200", "232080", "233740", "237370", "238720", "251340",
@@ -25,20 +25,60 @@ KOREA_ETF_CODES = [
     "426410", "438420", "461340"
 ]
 
-# --- 민감도 프로파일 (연 10회 내외 목표) ---
-CCI_LEN   = 14
-RSI_LEN   = 9
-OBV_DIFF  = 2    # OBV의 변화폭을 짧게 보아 단기 자금유입/이탈에 더 민감
-BUY_THRESHOLD  = 50
-SELL_THRESHOLD = 80  # 히스테리시스: BUY < SELL
 
-# 가중치: 동일
-W_CCI = 0.33
-W_RSI = 0.33
-W_OBV = 0.34
+@dataclass
+class OptimalCombo:
+    w_cci: float = 0.33
+    w_rsi: float = 0.33
+    w_obv: float = 0.34
+    buy_min: float = 50.0   # "강매수 임계값"
+    sell_min: float = 90.0  # "강매도 임계값"
+    max_threshold: float = 100.0  # Upper bound for percent mapping
 
-# ======================== 데이터 수집 ========================
-def get_naver_etf_price(code: str, pages: int = 5):
+    @classmethod
+    def from_text(cls, text: str) -> "OptimalCombo":
+        # Very tolerant parser for the provided "최적 조합.txt" format
+        import re
+        w_cci = 0.33
+        w_rsi = 0.33
+        w_obv = 0.34
+        buy_min = 50.0
+        sell_min = 90.0
+        for line in text.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if "CCI" in s and "가중치" in s:
+                m = re.search(r"([0-9]*\.?[0-9]+)", s)
+                if m: w_cci = float(m.group(1))
+            elif "RSI" in s and "가중치" in s:
+                m = re.search(r"([0-9]*\.?[0-9]+)", s)
+                if m: w_rsi = float(m.group(1))
+            elif "OBV" in s and "가중치" in s:
+                m = re.search(r"([0-9]*\.?[0-9]+)", s)
+                if m: w_obv = float(m.group(1))
+            elif "강매수" in s and "임계값" in s:
+                m = re.search(r"([0-9]*\.?[0-9]+)", s)
+                if m: buy_min = float(m.group(1))
+            elif "강매도" in s and "임계값" in s:
+                m = re.search(r"([0-9]*\.?[0-9]+)", s)
+                if m: sell_min = float(m.group(1))
+        return cls(w_cci=w_cci, w_rsi=w_rsi, w_obv=w_obv, buy_min=buy_min, sell_min=sell_min)
+
+
+def load_optimal_combo(file_path: Optional[str] = None) -> OptimalCombo:
+    # Attempts to read the on-disk "최적 조합.txt"; falls back to defaults if missing.
+    if not file_path:
+        file_path = "최적 조합.txt"
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return OptimalCombo.from_text(f.read())
+    except Exception:
+        return OptimalCombo()
+
+
+# === Data & Indicators ===
+def get_naver_etf_price(code: str, pages: int = 5) -> Optional[pd.DataFrame]:
     try:
         if not code.isdigit():
             return None
@@ -49,156 +89,160 @@ def get_naver_etf_price(code: str, pages: int = 5):
             res = requests.get(f"{url}&page={page}", headers=headers, timeout=10)
             soup = BeautifulSoup(res.text, "html.parser")
             table = soup.select_one("table[type='N']")
+            if table is None:
+                continue
             df = pd.read_html(StringIO(str(table)))[0].dropna()
             dfs.append(df)
+        if not dfs:
+            return None
         df_all = pd.concat(dfs, ignore_index=True)
-        df_all.columns = ['Date', 'Close', 'Change', 'Open', 'High', 'Low', 'Volume']
-        df_all['Date'] = pd.to_datetime(df_all['Date'])
-        df_all = df_all.sort_values('Date')
-        df_all.set_index('Date', inplace=True)
-        return df_all[['Open', 'High', 'Low', 'Close', 'Volume']]
+        df_all.columns = ["Date", "Close", "Change", "Open", "High", "Low", "Volume"]
+        df_all["Date"] = pd.to_datetime(df_all["Date"])
+        df_all = df_all.sort_values("Date")
+        df_all.set_index("Date", inplace=True)
+        return df_all[["Open", "High", "Low", "Close", "Volume"]]
     except Exception:
         return None
 
-# ======================== 스코어링 유틸 ========================
-def _scale_linear(x, x0, x1, y0=0.0, y1=100.0):
-    if x0 == x1:
-        return (y0 + y1) / 2.0
-    if x <= min(x0, x1):
-        return y0 if x0 < x1 else y1
-    if x >= max(x0, x1):
-        return y1 if x0 < x1 else y0
-    return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
 
-def _obv_continuous_score(obv_series: pd.Series) -> pd.Series:
-    """
-    OBV 연속 점수(0~100) 생성:
-      - OBV_trend = OBV.diff(OBV_DIFF)
-      - 20일 표준편차로 z-score → tanh로 매핑 → 0~100
-    """
-    obv_trend = obv_series.diff(OBV_DIFF)
-    rolling_std = obv_trend.rolling(20, min_periods=20).std()
-    z = obv_trend / (rolling_std.replace(0, np.nan))
-    score = 50.0 + 50.0 * np.tanh((z.fillna(0.0)) / 1.5)
-    return score.clip(0, 100), obv_trend
+def calculate_indicators(data: pd.DataFrame) -> Dict[str, float]:
+    close = pd.Series(data["Close"].to_numpy().ravel())
+    volume = pd.Series(data["Volume"].to_numpy().ravel())
+    high = pd.Series(data["High"].to_numpy().ravel())
+    low = pd.Series(data["Low"].to_numpy().ravel())
 
-# ======================== 지표 계산 ========================
-def calculate_indicators(data: pd.DataFrame) -> dict:
-    """
-    Returns dict with keys: CCI, RSI, OBV, OBV_trend, OBV_SCORE
-    (OBV_SCORE는 0~100 연속 점수)
-    """
-    close = pd.Series(data["Close"].to_numpy().ravel(), index=data.index)
-    volume = pd.Series(data["Volume"].to_numpy().ravel(), index=data.index)
-    high = pd.Series(data["High"].to_numpy().ravel(), index=data.index)
-    low = pd.Series(data["Low"].to_numpy().ravel(), index=data.index)
+    cci_indicator = ta.trend.CCIIndicator(high=high, low=low, close=close, window=20)
+    cci = float(cci_indicator.cci().iloc[-1])
 
-    # CCI, RSI (민감도 상향 기간)
-    cci_indicator = ta.trend.CCIIndicator(high=high, low=low, close=close, window=CCI_LEN)
-    cci = cci_indicator.cci()
-
-    rsi_indicator = ta.momentum.RSIIndicator(close=close, window=RSI_LEN)
-    rsi = rsi_indicator.rsi()
-
-    # OBV + 연속점수
     obv_indicator = ta.volume.OnBalanceVolumeIndicator(close=close, volume=volume)
     obv = obv_indicator.on_balance_volume()
-    obv_score, obv_trend = _obv_continuous_score(obv)
+    obv_trend = float(obv.iloc[-1] - obv.iloc[-8]) if len(obv) >= 8 else 0.0
 
-    return {
-        "CCI": float(cci.iloc[-1]) if len(cci) else 0.0,
-        "RSI": float(rsi.iloc[-1]) if len(rsi) else 0.0,
-        "OBV": float(obv.iloc[-1]) if len(obv) else 0.0,
-        "OBV_trend": float(obv_trend.iloc[-1]) if len(obv_trend) else 0.0,
-        "OBV_SCORE": float(obv_score.iloc[-1]) if len(obv_score) else 50.0,
-    }
+    rsi_indicator = ta.momentum.RSIIndicator(close=close, window=14)
+    rsi = float(rsi_indicator.rsi().iloc[-1])
 
-# ======================== 컴포넌트 스코어 ========================
-def _component_scores_for_buy(cci, rsi, obv_score):
-    cci_s = _scale_linear(cci, -100, 100, 100, 0)   # 과매도일수록 가산
-    rsi_s = _scale_linear(rsi, 30, 70, 100, 0)      # 30 이하 우수
-    obv_s = float(obv_score)                        # 0~100
-    return cci_s, rsi_s, obv_s
+    return {"CCI": cci, "OBV_trend": obv_trend, "RSI": rsi}
 
-def _component_scores_for_sell(cci, rsi, obv_score):
-    cci_s = _scale_linear(cci, -100, 100, 0, 100)   # 과매수일수록 가산
-    rsi_s = _scale_linear(rsi, 30, 70, 0, 100)      # 70 이상 우수
-    obv_s = 100.0 - float(obv_score)                # 유출 쪽에 가산
-    return cci_s, rsi_s, obv_s
 
-def score_buy(cci, rsi, obv_score):
-    cci_s, rsi_s, obv_s = _component_scores_for_buy(cci, rsi, obv_score)
-    return W_CCI * cci_s + W_RSI * rsi_s + W_OBV * obv_s
+# === Normalization helpers (0~100 bullish/bearish scores) ===
+def _clip01(x: float) -> float:
+    return 0.0 if x < 0 else (1.0 if x > 1 else x)
 
-def score_sell(cci, rsi, obv_score):
-    cci_s, rsi_s, obv_s = _component_scores_for_sell(cci, rsi, obv_score)
-    return W_CCI * cci_s + W_RSI * rsi_s + W_OBV * obv_s
 
-# ======================== 신호 생성 ========================
-def generate_signal(indicators: dict, decision: str):
+def _bullish_components(cci: float, rsi: float, obv_trend: float) -> Dict[str, float]:
+    # Lower CCI and RSI are bullish for "매수" side.
+    cci_bull = _clip01((0.0 - cci) / 200.0) * 100.0          # cci <= -200 -> 100, cci >= 0 -> 0
+    rsi_bull = _clip01((50.0 - rsi) / 20.0) * 100.0          # rsi <= 30 -> 100, rsi >= 50 -> 0
+    obv_bull = 100.0 if obv_trend > 0 else 0.0               # sign-based
+    return {"CCI": cci_bull, "RSI": rsi_bull, "OBV": obv_bull}
+
+
+def _bearish_components(cci: float, rsi: float, obv_trend: float) -> Dict[str, float]:
+    # Higher CCI and RSI are bearish for "매도" side.
+    cci_bear = _clip01(cci / 200.0) * 100.0                  # cci >= +200 -> 100, cci <= 0 -> 0
+    rsi_bear = _clip01((rsi - 50.0) / 20.0) * 100.0          # rsi >= 70 -> 100, rsi <= 50 -> 0
+    obv_bear = 100.0 if obv_trend < 0 else 0.0               # sign-based
+    return {"CCI": cci_bear, "RSI": rsi_bear, "OBV": obv_bear}
+
+
+def _weighted_sum(components: Dict[str, float], combo: OptimalCombo) -> float:
+    return components["CCI"] * combo.w_cci + components["RSI"] * combo.w_rsi + components["OBV"] * combo.w_obv
+
+
+def _percent_from_threshold(score: float, min_thr: float, max_thr: float) -> int:
+    # Below min -> 0%; at min -> 1%; at/above max -> 100%
+    if score < min_thr:
+        return 0
+    if score >= max_thr:
+        return 100
+    # Map linearly to 1..100
+    return int(1 + (score - min_thr) * 99.0 / (max_thr - min_thr))
+
+
+def _level_from_percent(p: int) -> str:
+    if p == 0:
+        return "미달"
+    if p >= 71:
+        return "매우강함"
+    if p >= 41:
+        return "강함"
+    return "적정"  # 1~40%
+
+
+def _color_from_percent(decision: str, p: int) -> str:
+    # Green-ish when strong, yellow mid, orange low, red when 0%
+    if p == 0:
+        return "#F44336"  # red
+    if p >= 71:
+        return "#2E7D32"  # strong green
+    if p >= 41:
+        return "#FBC02D"  # amber
+    return "#FB8C00"      # orange
+
+
+# === Public API ===
+def generate_signal(indicators: Dict[str, float], decision: str) -> Dict[str, object]:
     """
-    decision: "매수" 또는 "매도"
-    반환: { recommendation, score, strength, color, level, reason }
+    Args:
+        indicators: {"CCI": float, "OBV_trend": float, "RSI": float}
+        decision: "매수" 또는 "매도"
+    Returns:
+        {
+            "recommendation": "매수"/"매도" or "매수X"/"매도X",
+            "score": int,            # raw weighted score (0~100 rounded)
+            "strength_pct": int,     # 0~100% (0 when below min threshold; 1~100 within min~max)
+            "color": str,
+            "level": str,            # 적정/강함/매우강함/미달
+            "reason": str,           # 간단 사유
+            "components": {...},     # 지표별 0~100 기여도
+            "thresholds": {"min": float, "max": float}
+        }
     """
-    cci = indicators.get("CCI", 0.0)
-    rsi = indicators.get("RSI", 0.0)
-    obv_score = indicators.get("OBV_SCORE", None)
+    combo = load_optimal_combo()  # Falls back to defaults if the file is missing.
+    cci = float(indicators.get("CCI", 0.0))
+    obv_trend = float(indicators.get("OBV_trend", 0.0))
+    rsi = float(indicators.get("RSI", 0.0))
 
-    # 하위호환: OBV_SCORE가 없으면 방향성으로만 0/50/100 근사
-    if obv_score is None:
-        obv_trend = indicators.get("OBV_trend", 0.0)
-        obv_score = 100.0 if obv_trend > 0 else (0.0 if obv_trend < 0 else 50.0)
+    bull = _bullish_components(cci, rsi, obv_trend)
+    bear = _bearish_components(cci, rsi, obv_trend)
+
+    buy_score = _weighted_sum(bull, combo)     # 0~100
+    sell_score = _weighted_sum(bear, combo)    # 0~100
 
     if decision == "매수":
-        score_f = score_buy(cci, rsi, obv_score)
-        recommendation = "매수" if score_f >= BUY_THRESHOLD else "매수X"
-        # 단계/색상
-        if score_f >= 90:
-            level, color = "매우 강함", "#2E7D32"
-        elif score_f >= 70:
-            level, color = "강함", "#4CAF50"
-        elif score_f >= 50:
-            level, color = "보통", "#FFEB3B"
-        else:
-            level, color = "약함", "#F44336"
-        # 사유
-        reasons = [
-            ("CCI 과매도" if cci <= -100 else "CCI 중립" if -100 < cci < 100 else "CCI 과매수"),
-            ("OBV 유입 강함" if obv_score >= 60 else "OBV 정체" if 40 <= obv_score < 60 else "OBV 유출"),
-            ("RSI 과매도(≤30)" if rsi <= 30 else "RSI 중립(30~70)" if 30 < rsi < 70 else "RSI 과매수(≥70)"),
-        ]
+        min_thr = combo.buy_min
+        max_thr = combo.max_threshold
+        strength_pct = _percent_from_threshold(buy_score, min_thr, max_thr)
+        score_to_report = int(round(buy_score))
+        recommendation = "매수" if strength_pct > 0 else "매수X"
+        components = bull
+        reason = []
+        reason.append(f"CCI={cci:.0f} → 매수 관점 {bull['CCI']:.0f}점")
+        reason.append(f"RSI={rsi:.0f} → 매수 관점 {bull['RSI']:.0f}점")
+        reason.append(f"OBV 추세={'상승' if obv_trend>0 else '하락/정체'} → {bull['OBV']:.0f}점")
     else:
-        score_f = score_sell(cci, rsi, obv_score)
-        recommendation = "매도" if score_f >= SELL_THRESHOLD else "매도X"
-        if score_f >= 90:
-            level, color = "매우 강함", "#B71C1C"
-        elif score_f >= 70:
-            level, color = "강함", "#E53935"
-        elif score_f >= 50:
-            level, color = "보통", "#FF9800"
-        else:
-            level, color = "약함", "#9E9E9E"
-        reasons = [
-            ("CCI 과매수" if cci >= 100 else "CCI 중립" if -100 < cci < 100 else "CCI 과매도"),
-            ("OBV 유출 강함" if obv_score <= 40 else "OBV 정체" if 40 < obv_score < 60 else "OBV 유입"),
-            ("RSI 과매수(≥70)" if rsi >= 70 else "RSI 중립(30~70)" if 30 < rsi < 70 else "RSI 과매도(≤30)"),
-        ]
+        min_thr = combo.sell_min
+        max_thr = combo.max_threshold
+        strength_pct = _percent_from_threshold(sell_score, min_thr, max_thr)
+        score_to_report = int(round(sell_score))
+        recommendation = "매도" if strength_pct > 0 else "매도X"
+        components = bear
+        reason = []
+        reason.append(f"CCI={cci:.0f} → 매도 관점 {bear['CCI']:.0f}점")
+        reason.append(f"RSI={rsi:.0f} → 매도 관점 {bear['RSI']:.0f}점")
+        reason.append(f"OBV 추세={'하락' if obv_trend<0 else '상승/정체'} → {bear['OBV']:.0f}점")
 
-    if decision == "매수":
-        if score_f < BUY_THRESHOLD:
-            score_int = 0
-        else:
-            score_int = int(round(1 + (score_f - BUY_THRESHOLD) * 99 / (100 - BUY_THRESHOLD)))
-    else:  # 매도
-        if score_f < SELL_THRESHOLD:
-            score_int = 0
-        else:
-            score_int = int(round(1 + (score_f - SELL_THRESHOLD) * 99 / (100 - SELL_THRESHOLD)))
+    level = _level_from_percent(strength_pct)
+    color = _color_from_percent(decision, strength_pct)
+
     return {
         "recommendation": recommendation,
-        "score": score_int,
-        "strength": score_int,
+        "score": score_to_report,
+        "strength_pct": int(strength_pct),
         "color": color,
         "level": level,
-        "reason": " / ".join(reasons)
+        "reason": "\n".join(reason),  # 줄바꿈으로 임계/사유 구분 표시 용이
+        "components": {k: int(round(v)) for k, v in components.items()},
+        "thresholds": {"min": float(min_thr), "max": float(max_thr)},
+        "weights": {"CCI": combo.w_cci, "RSI": combo.w_rsi, "OBV": combo.w_obv},
     }
