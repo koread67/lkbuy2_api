@@ -1,18 +1,20 @@
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from utils import calculate_indicators, generate_signal
-import traceback
-import requests
 import pandas as pd
+import requests
 from io import StringIO
+from datetime import datetime
 import math
+
+# === utils.py hooks ===
+from utils import calculate_indicators, generate_signal
 
 ALPHA_VANTAGE_API_KEY = "2QD3PFZE54GZO088"
 
-app = FastAPI(title="LKBUY2 API")
+app = FastAPI(title="LKBUY2 API (render-fix)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,17 +28,34 @@ class AnalysisRequest(BaseModel):
     symbol: str
     decision: str
 
-def safe_float(value):
+def _safe_float(x):
     try:
-        if value is None:
+        if x is None:
             return 0.0
-        # allow strings like "85%"
-        if isinstance(value, str) and value.endswith('%'):
-            value = value[:-1]
-        v = float(value)
+        s = str(x).strip()
+        if s.endswith('%'):
+            s = s[:-1]
+        v = float(s)
         return v if math.isfinite(v) else 0.0
     except Exception:
         return 0.0
+
+def fetch_from_yahoo(symbol: str):
+    try:
+        import yfinance as yf
+        tk = yf.Ticker(symbol)
+        df = tk.history(period="6mo", interval="1d", auto_adjust=False)
+        if df is None or df.empty:
+            return None
+        df = df.rename(columns=str.title)[["Open","High","Low","Close","Volume"]]
+        df = df.dropna().reset_index(drop=False)
+        # Ensure monotonic by date
+        if "Date" in df.columns:
+            df = df.sort_values("Date").reset_index(drop=True)
+        return df.tail(120)
+    except Exception as e:
+        print("Yahoo fetch fail:", e)
+        return None
 
 def fetch_from_alpha_vantage(symbol: str):
     try:
@@ -47,107 +66,117 @@ def fetch_from_alpha_vantage(symbol: str):
             "apikey": ALPHA_VANTAGE_API_KEY,
             "outputsize": "compact"
         }
-        response = requests.get(url, params=params)
-        print(f"🔍 Alpha 요청 URL: {response.url}")
-        if response.status_code != 200:
-            print(f"❌ Alpha 요청 실패 (status: {response.status_code})")
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+        ts = data.get("Time Series (Daily)")
+        if not ts:
+            print("Alpha response has no TS:", list(data.keys()))
             return None
-        data = response.json()
-        if "Time Series (Daily)" not in data:
-            print("❌ Alpha 응답에 Time Series 없음:", data)
-            return None
-
-        df = pd.DataFrame(data["Time Series (Daily)"]).T
-        df = df.astype(float)
+        df = pd.DataFrame(ts).T.astype(float)
         df = df.rename(columns={
             "1. open": "Open", "2. high": "High", "3. low": "Low",
             "4. close": "Close", "5. volume": "Volume"
-        })[["Open", "High", "Low", "Close", "Volume"]]
-        return df.tail(90)
+        })[["Open","High","Low","Close","Volume"]]
+        df = df.iloc[::-1].reset_index(drop=False).rename(columns={"index":"Date"})
+        df["Date"] = pd.to_datetime(df["Date"])
+        return df.tail(120)
     except Exception as e:
-        print("❌ Alpha 처리 중 오류:", e)
+        print("Alpha fetch fail:", e)
         return None
 
-def fetch_from_krx(symbol: str, pages: int = 5):
+def fetch_from_krx_naver(code: str, pages: int = 5):
     try:
-        symbol = symbol.zfill(6)
+        code = code.zfill(6)
         headers = {"User-Agent": "Mozilla/5.0"}
-        all_dfs = []
-        for page in range(1, pages + 1):
-            url = f"https://finance.naver.com/item/sise_day.nhn?code={symbol}&page={page}"
-            print(f"📡 KRX 요청 중 (p{page}): {url}")
-            response = requests.get(url, headers=headers)
-            dfs = pd.read_html(StringIO(response.text), header=0)
-            if dfs:
-                all_dfs.append(dfs[0])
-        if not all_dfs:
+        dfs = []
+        for page in range(1, pages+1):
+            url = f"https://finance.naver.com/item/sise_day.naver?code={code}&page={page}"
+            res = requests.get(url, headers=headers, timeout=12)
+            tbls = pd.read_html(StringIO(res.text))
+            if not tbls:
+                continue
+            df = tbls[0]
+            dfs.append(df)
+        if not dfs:
             return None
-        df = pd.concat(all_dfs)
-        print(f"📋 누적 수집된 DataFrame 크기 (raw): {df.shape}")
-
-        df = df.dropna(how="all")
-        df = df.rename(columns={"종가": "Close", "거래량": "Volume", "고가": "High", "저가": "Low"})
-        for col in ["Close", "Volume", "High", "Low"]:
-            df[col] = df[col].astype(str).str.replace(",", "").astype(float)
-        df["Open"] = df[["Close", "High", "Low"]].mean(axis=1)
-        result = df.iloc[::-1].reset_index(drop=True)
-        print(f"✅ 정제된 DataFrame 크기: {result.shape}")
-        return result
+        df = pd.concat(dfs, ignore_index=True)
+        df = df.dropna().reset_index(drop=True)
+        df = df.rename(columns={
+            "날짜":"Date","종가":"Close","고가":"High","저가":"Low","거래량":"Volume"
+        })
+        # Some pages don't have Open; approximate using H/L/C mean
+        for col in ["Close","High","Low","Volume"]:
+            df[col] = pd.to_numeric(df[col].astype(str).str.replace(",",""), errors="coerce")
+        df["Open"] = df[["Close","High","Low"]].mean(axis=1)
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+        return df[["Date","Open","High","Low","Close","Volume"]].tail(180)
     except Exception as e:
-        print("❌ KRX 다중 페이지 파싱 실패:", e)
+        print("KRX fetch fail:", e)
         return None
 
 @app.post("/analyze")
-def analyze_stock(req: AnalysisRequest, request: Request):
-    try:
-        print(f"✅ 요청 받음: symbol={req.symbol}, decision={req.decision}")
-        data = fetch_from_alpha_vantage(req.symbol)
+def analyze(req: AnalysisRequest):
+    symbol = (req.symbol or "").strip()
+    decision = (req.decision or "매수").strip()
 
-        if data is None or data.empty:
-            if req.symbol.isdigit() and len(req.symbol.zfill(6)) == 6:
-                print("⚠️ Alpha 실패, 숫자형 종목으로 KRX 시도")
-                data = fetch_from_krx(req.symbol, pages=5)
-            else:
-                print("🚫 Alpha 실패 + KRX 우회 차단 (비숫자 종목코드)")
+    if not symbol:
+        return JSONResponse({"error":"symbol required"}, status_code=400)
 
-        if data is None or (hasattr(data, "empty") and data.empty):
-            return JSONResponse(
-                content={"symbol": req.symbol, "message": "검출안됨"},
-                media_type="application/json; charset=utf-8",
-                status_code=404
-            )
+    df = None
+    source = None
 
-        indicators = calculate_indicators(data)
-        result = generate_signal(indicators, req.decision)
+    # Domestic numeric -> KRX
+    if symbol.isdigit() and len(symbol) <= 6:
+        df = fetch_from_krx_naver(symbol)
+        source = "krx_naver"
 
-        # NOTE: utils.generate_signal now returns:
-        # - strength_pct (int, 0~100)
-        # - strength (str, "85%")
-        response = {
-            "symbol": req.symbol,
-            "decision_requested": req.decision,
-            "recommendation": str(result.get("recommendation", "")),
-            "conviction_score": safe_float(result.get("score")),
-            "strength_pct": int(result.get("strength_pct", 0)),
-            "strength": str(result.get("strength", f"{int(result.get('strength_pct', 0))}%")),
-            "level": str(result.get("level", "")),
-            "color": str(result.get("color", "#F44336")),
-            "reason": str(result.get("reason", "")),
-            "thresholds": result.get("thresholds", {}),
-            "weights": result.get("weights", {}),
-            "indicators": {
-                "CCI": safe_float(indicators.get("CCI")),       # present
-                "OBV_trend": safe_float(indicators.get("OBV_trend")), # present
-                "RSI": safe_float(indicators.get("RSI")),       # present
-            }
-        }
+    # Overseas / non-numeric -> Yahoo first, then Alpha
+    if df is None and not symbol.isdigit():
+        df = fetch_from_yahoo(symbol)
+        source = "yahoo" if df is not None else None
+    if df is None:
+        df = fetch_from_alpha_vantage(symbol)
+        if df is not None:
+            source = "alpha_vantage"
 
-        return JSONResponse(content=response, media_type="application/json; charset=utf-8")
-    except Exception as e:
-        print("❌ 서버 오류:", str(e))
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+    if df is None or df.empty:
+        return JSONResponse({"symbol": symbol, "message": "데이터 없음 또는 제공처 제한", "source": source}, status_code=404)
 
-@app.get("/")
-def root():
-    return {"message": "LKBUY2 API is running"}
+    # Prepare OHLCV for utils
+    data = df[["Open","High","Low","Close","Volume"]].copy()
+    indicators = calculate_indicators(data)
+    result = generate_signal(indicators, decision)
+
+    # Compose debug fields to verify change by symbol/decision
+    debug = {
+        "symbol": symbol,
+        "decision_requested": decision,
+        "data_source": source,
+        "rows": int(len(df)),
+        "last_date": df["Date"].iloc[-1].strftime("%Y-%m-%d") if "Date" in df.columns else None,
+        "raw_indicators": {k: _safe_float(v) for k,v in indicators.items()},
+        "buy_score": result.get("components",{}),  # component contribution for selected side
+        "thresholds": result.get("thresholds",{}),
+    }
+
+    resp = {
+        "symbol": symbol,
+        "decision_requested": decision,
+        "recommendation": str(result.get("recommendation","")),
+        "conviction_score": _safe_float(result.get("score")),
+        "strength_pct": int(result.get("strength_pct", 0)),
+        "strength": str(result.get("strength", f"{int(result.get('strength_pct',0))}%")),
+        "level": str(result.get("level","")),
+        "color": str(result.get("color","#F44336")),
+        "reason": str(result.get("reason","")),
+        "thresholds": result.get("thresholds", {}),
+        "weights": result.get("weights", {}),
+        "indicators": {
+            "CCI": _safe_float(indicators.get("CCI")),
+            "OBV_trend": _safe_float(indicators.get("OBV_trend")),
+            "RSI": _safe_float(indicators.get("RSI")),
+        },
+        "debug": debug,
+    }
+    return JSONResponse(resp, media_type="application/json; charset=utf-8")
