@@ -1,12 +1,11 @@
+
 # -*- coding: utf-8 -*-
 """
-utils_tuned.py
-- 목표: '1년에 10회 내외'의 매매 빈도를 기본 프로파일로 달성하도록 로직 민감도 상향
-- 변경점
-  1) 지표 기간: CCI=14, RSI=9, OBV_DIFF=2 (단기 반응 ↑)
-  2) OBV를 연속 점수(0~100)로 변환하여 경계 근처에서도 신호가 더 자주 발생
-  3) 기본 임계값: BUY=50, SELL=80 (히스테리시스 보장: BUY < SELL)
-  4) generate_signal()은 기존 출력키를 그대로 유지 (recommendation/score/strength/color/level/reason)
+utils_strength_level_pct_final.py
+- BUY 임계값 50, SELL 임계값 90 (최적 조합 기준 반영)
+- 강도 표기 형식: "레벨 / XX%"
+- 매수/매도 각각 임계값~100 구간을 0~100%로 선형 환산
+- 기존 출력 키: recommendation / score / strength / color / level / reason
 """
 
 import pandas as pd
@@ -30,9 +29,9 @@ CCI_LEN   = 14
 RSI_LEN   = 9
 OBV_DIFF  = 2    # OBV의 변화폭을 짧게 보아 단기 자금유입/이탈에 더 민감
 BUY_THRESHOLD  = 50
-SELL_THRESHOLD = 80  # 히스테리시스: BUY < SELL
+SELL_THRESHOLD = 90  # 최적 조합 기준으로 상향
 
-# 가중치: 동일
+# 가중치
 W_CCI = 0.33
 W_RSI = 0.33
 W_OBV = 0.34
@@ -135,6 +134,14 @@ def score_sell(cci, rsi, obv_score):
     return W_CCI * cci_s + W_RSI * rsi_s + W_OBV * obv_s
 
 # ======================== 신호 생성 ========================
+def _percent_from_threshold(score_f: float, threshold: float) -> float:
+    """임계값~100 구간을 0~100%로 환산"""
+    if score_f < threshold:
+        return 0.0
+    if threshold >= 100:
+        return 100.0 if score_f >= threshold else 0.0
+    return max(0.0, min(100.0, (score_f - threshold) / (100.0 - threshold) * 100.0))
+
 def generate_signal(indicators: dict, decision: str):
     """
     decision: "매수" 또는 "매도"
@@ -154,14 +161,14 @@ def generate_signal(indicators: dict, decision: str):
         recommendation = "매수" if score_f >= BUY_THRESHOLD else "매수X"
         # 단계/색상
         if score_f >= 90:
-            level, color = "매우 강함", "#2E7D32"
+            level, color = "매수 매우 강함", "#2E7D32"
         elif score_f >= 70:
-            level, color = "강함", "#4CAF50"
-        elif score_f >= 50:
-            level, color = "보통", "#FFEB3B"
+            level, color = "매수 강함", "#4CAF50"
+        elif score_f >= BUY_THRESHOLD:
+            level, color = "매수 적정", "#FFEB3B"
         else:
             level, color = "약함", "#F44336"
-        # 사유
+        percent = _percent_from_threshold(score_f, BUY_THRESHOLD)
         reasons = [
             ("CCI 과매도" if cci <= -100 else "CCI 중립" if -100 < cci < 100 else "CCI 과매수"),
             ("OBV 유입 강함" if obv_score >= 60 else "OBV 정체" if 40 <= obv_score < 60 else "OBV 유출"),
@@ -171,13 +178,14 @@ def generate_signal(indicators: dict, decision: str):
         score_f = score_sell(cci, rsi, obv_score)
         recommendation = "매도" if score_f >= SELL_THRESHOLD else "매도X"
         if score_f >= 90:
-            level, color = "매우 강함", "#B71C1C"
-        elif score_f >= 70:
-            level, color = "강함", "#E53935"
-        elif score_f >= 50:
-            level, color = "보통", "#FF9800"
+            level, color = "매도 매우 강함", "#B71C1C"
+        elif score_f >= 80:
+            level, color = "매도 강함", "#E53935"
+        elif score_f >= SELL_THRESHOLD:
+            level, color = "매도 적정", "#FF9800"
         else:
             level, color = "약함", "#9E9E9E"
+        percent = _percent_from_threshold(score_f, SELL_THRESHOLD)
         reasons = [
             ("CCI 과매수" if cci >= 100 else "CCI 중립" if -100 < cci < 100 else "CCI 과매도"),
             ("OBV 유출 강함" if obv_score <= 40 else "OBV 정체" if 40 < obv_score < 60 else "OBV 유입"),
@@ -185,10 +193,11 @@ def generate_signal(indicators: dict, decision: str):
         ]
 
     score_int = int(round(score_f))
+    strength_text = f"{level} / {percent:.0f}%"
     return {
         "recommendation": recommendation,
         "score": score_int,
-        "strength": score_int,
+        "strength": strength_text,
         "color": color,
         "level": level,
         "reason": " / ".join(reasons)
