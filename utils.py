@@ -37,7 +37,7 @@ class OptimalCombo:
 
     @classmethod
     def from_text(cls, text: str) -> "OptimalCombo":
-        # Very tolerant parser for the provided "최적 조합.txt" format
+        # Tolerant parser for the provided "최적 조합.txt" format
         import re
         w_cci = 0.33
         w_rsi = 0.33
@@ -169,7 +169,7 @@ def _level_from_percent(p: int) -> str:
     return "적정"  # 1~40%
 
 
-def _color_from_percent(decision: str, p: int) -> str:
+def _color_from_percent(p: int) -> str:
     # Green-ish when strong, yellow mid, orange low, red when 0%
     if p == 0:
         return "#F44336"  # red
@@ -178,6 +178,19 @@ def _color_from_percent(decision: str, p: int) -> str:
     if p >= 41:
         return "#FBC02D"  # amber
     return "#FB8C00"      # orange
+
+
+def _compact_reason(decision: str, cci: float, rsi: float, obv_trend: float) -> str:
+    # Build compact Korean phrases like "CCI 중립 / OBV 유출 / RSI 중립"
+    if decision == "매수":
+        cci_str = "중립" if cci >= -100 else "과매도"
+        rsi_str = "중립" if rsi >= 30 else "과매도"
+        obv_str = "유입" if obv_trend > 0 else "유출"
+    else:
+        cci_str = "중립" if cci <= 100 else "과매수"
+        rsi_str = "중립" if rsi <= 70 else "과매수"
+        obv_str = "유출" if obv_trend < 0 else "유입"
+    return f"CCI {cci_str} / OBV {obv_str} / RSI {rsi_str}"
 
 
 # === Public API ===
@@ -189,12 +202,13 @@ def generate_signal(indicators: Dict[str, float], decision: str) -> Dict[str, ob
     Returns:
         {
             "recommendation": "매수"/"매도" or "매수X"/"매도X",
-            "score": int,            # raw weighted score (0~100 rounded)
-            "strength_pct": int,     # 0~100% (0 when below min threshold; 1~100 within min~max)
+            "score": int,             # raw weighted score (0~100 rounded)
+            "strength_pct": int,      # 0~100% (0 when below min threshold; 1~100 within min~max)
+            "strength": str,          # "85%" (widget-friendly)
             "color": str,
-            "level": str,            # 적정/강함/매우강함/미달
-            "reason": str,           # 간단 사유
-            "components": {...},     # 지표별 0~100 기여도
+            "level": str,             # 적정/강함/매우강함/미달
+            "reason": str,            # compact + newline + (임계값: ~)
+            "components": {...},      # 지표별 0~100 기여도
             "thresholds": {"min": float, "max": float}
         }
     """
@@ -216,10 +230,6 @@ def generate_signal(indicators: Dict[str, float], decision: str) -> Dict[str, ob
         score_to_report = int(round(buy_score))
         recommendation = "매수" if strength_pct > 0 else "매수X"
         components = bull
-        reason = []
-        reason.append(f"CCI={cci:.0f} → 매수 관점 {bull['CCI']:.0f}점")
-        reason.append(f"RSI={rsi:.0f} → 매수 관점 {bull['RSI']:.0f}점")
-        reason.append(f"OBV 추세={'상승' if obv_trend>0 else '하락/정체'} → {bull['OBV']:.0f}점")
     else:
         min_thr = combo.sell_min
         max_thr = combo.max_threshold
@@ -227,21 +237,21 @@ def generate_signal(indicators: Dict[str, float], decision: str) -> Dict[str, ob
         score_to_report = int(round(sell_score))
         recommendation = "매도" if strength_pct > 0 else "매도X"
         components = bear
-        reason = []
-        reason.append(f"CCI={cci:.0f} → 매도 관점 {bear['CCI']:.0f}점")
-        reason.append(f"RSI={rsi:.0f} → 매도 관점 {bear['RSI']:.0f}점")
-        reason.append(f"OBV 추세={'하락' if obv_trend<0 else '상승/정체'} → {bear['OBV']:.0f}점")
 
     level = _level_from_percent(strength_pct)
-    color = _color_from_percent(decision, strength_pct)
+    color = _color_from_percent(strength_pct)
+
+    compact = _compact_reason(decision, cci, rsi, obv_trend)
+    reason = compact + f"\n(임계값: {decision} {min_thr:g} ~ {max_thr:g})"
 
     return {
         "recommendation": recommendation,
         "score": score_to_report,
         "strength_pct": int(strength_pct),
+        "strength": f"{int(strength_pct)}%",  # widget에서 바로 출력 가능
         "color": color,
         "level": level,
-        "reason": "\n".join(reason),  # 줄바꿈으로 임계/사유 구분 표시 용이
+        "reason": reason,  # 줄바꿈 포함
         "components": {k: int(round(v)) for k, v in components.items()},
         "thresholds": {"min": float(min_thr), "max": float(max_thr)},
         "weights": {"CCI": combo.w_cci, "RSI": combo.w_rsi, "OBV": combo.w_obv},
