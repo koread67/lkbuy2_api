@@ -1,8 +1,9 @@
 fastapi
 uvicorn
 pydantic
-requests
 pandas
-ta
-lxml
+requests
 beautifulsoup4
+lxml
+ta
+yfinance
