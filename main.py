@@ -13,12 +13,11 @@ from pydantic import BaseModel
 
 from utils import calculate_indicators, generate_signal
 
-# === API Keys ===
-# Render(배포)에서는 FINNHUB_API_KEY 환경변수를 사용하세요.
-# 로컬에서는 환경변수가 없으면 아래 폴백 키가 사용됩니다.
+# === Config ===
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "d2jqag1r01qj8a5kmhigd2jqag1r01qj8a5kmhj0")
+ALLOW_YAHOO_FALLBACK = os.getenv("ALLOW_YAHOO_FALLBACK", "0") == "1"  # set to 1 on Render to enable
 
-app = FastAPI(title="LKBUY2 API (Final: KRX + Finnhub)")
+app = FastAPI(title="LKBUY2 API (Final+Debug)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,13 +43,12 @@ def _safe_float(x):
     except Exception:
         return 0.0
 
-# === Data fetchers ===
 def fetch_from_finnhub(symbol: str):
-    """Daily OHLCV via Finnhub (resolution=D)."""
+    last_error = None
     try:
         url = "https://finnhub.io/api/v1/stock/candle"
         now = int(time.time())
-        past = now - 60*60*24*220  # 약 220일
+        past = now - 60*60*24*220  # ~220 days
         params = {
             "symbol": symbol,
             "resolution": "D",
@@ -59,9 +57,13 @@ def fetch_from_finnhub(symbol: str):
             "token": FINNHUB_API_KEY
         }
         r = requests.get(url, params=params, timeout=20)
-        data = r.json()
-        if data.get("s") != "ok":
-            return None
+        try:
+            data = r.json()
+        except Exception:
+            return None, f"finnhub_http_status:{r.status_code} body_nonjson"
+        status = data.get("s")
+        if status != "ok":
+            return None, f"finnhub_status:{status} details:{data}"
         df = pd.DataFrame({
             "Date": pd.to_datetime(data.get("t", []), unit="s"),
             "Open": data.get("o", []),
@@ -71,14 +73,32 @@ def fetch_from_finnhub(symbol: str):
             "Volume": data.get("v", [])
         })
         if df.empty:
-            return None
+            return None, "finnhub_empty_df"
         df = df.dropna().sort_values("Date").reset_index(drop=True)
-        return df.tail(120)
-    except Exception:
-        return None
+        return df.tail(120), None
+    except Exception as e:
+        last_error = f"finnhub_exception:{e}"
+        return None, last_error
+
+def fetch_from_yahoo(symbol: str):
+    try:
+        import yfinance as yf
+    except Exception as e:
+        return None, f"yahoo_import_error:{e}"
+    try:
+        tk = yf.Ticker(symbol)
+        df = tk.history(period="6mo", interval="1d", auto_adjust=False)
+        if df is None or df.empty:
+            return None, "yahoo_empty"
+        df = df.rename(columns=str.title)[["Open","High","Low","Close","Volume"]]
+        df = df.dropna().reset_index(drop=False)
+        if "Date" in df.columns:
+            df = df.sort_values("Date").reset_index(drop=True)
+        return df.tail(120), None
+    except Exception as e:
+        return None, f"yahoo_error:{e}"
 
 def fetch_from_krx_naver(code: str, pages: int = 5):
-    """국내(6자리 숫자) 종목 일별 시세를 네이버에서 스크래핑."""
     try:
         code = code.zfill(6)
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -92,7 +112,7 @@ def fetch_from_krx_naver(code: str, pages: int = 5):
             df = tbls[0]
             dfs.append(df)
         if not dfs:
-            return None
+            return None, "krx_no_tables"
         df = pd.concat(dfs, ignore_index=True)
         df = df.dropna().reset_index(drop=True)
         df = df.rename(columns={
@@ -100,24 +120,22 @@ def fetch_from_krx_naver(code: str, pages: int = 5):
         })
         for col in ["Close","High","Low","Volume"]:
             df[col] = pd.to_numeric(df[col].astype(str).str.replace(",",""), errors="coerce")
-        # 일부 페이지에는 시가가 없어 H/L/C 평균으로 근사
         df["Open"] = df[["Close","High","Low"]].mean(axis=1)
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
         df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
-        return df[["Date","Open","High","Low","Close","Volume"]].tail(180)
-    except Exception:
-        return None
+        return df[["Date","Open","High","Low","Close","Volume"]].tail(180), None
+    except Exception as e:
+        return None, f"krx_exception:{e}"
 
-# === Healthcheck ===
 @app.get("/health")
 def health():
     return {
         "status": "ok",
         "finnhub_key_set": bool(FINNHUB_API_KEY),
-        "source": "KRX+Finnhub"
+        "allow_yahoo_fallback": ALLOW_YAHOO_FALLBACK,
+        "source": "KRX+Finnhub(+YahooOpt)"
     }
 
-# === Main endpoint ===
 @app.post("/analyze")
 def analyze(req: AnalysisRequest):
     symbol = (req.symbol or "").strip()
@@ -126,39 +144,39 @@ def analyze(req: AnalysisRequest):
     if not symbol:
         return JSONResponse({"error":"symbol required"}, status_code=400)
 
+    tried = []
     df = None
     source = None
 
-    # 숫자(국내) → 네이버
     if symbol.isdigit() and len(symbol) <= 6:
-        df = fetch_from_krx_naver(symbol)
+        df, err = fetch_from_krx_naver(symbol)
         source = "krx_naver"
-
-    # 해외 티커 → Finnhub
-    if df is None and not symbol.isdigit():
-        df = fetch_from_finnhub(symbol)
+        if df is None:
+            tried.append({"source":"krx_naver","error":err})
+    else:
+        df, err = fetch_from_finnhub(symbol)
         if df is not None:
             source = "finnhub"
+        else:
+            tried.append({"source":"finnhub","error":err})
+            if ALLOW_YAHOO_FALLBACK:
+                df, yerr = fetch_from_yahoo(symbol)
+                if df is not None:
+                    source = "yahoo"
+                else:
+                    tried.append({"source":"yahoo","error":yerr})
 
     if df is None or df.empty:
         return JSONResponse({
             "symbol": symbol,
             "message": "데이터 없음 또는 제공처 제한",
-            "source": source
+            "source": source,
+            "tried": tried
         }, status_code=404)
 
-    # 지표 계산
     data = df[["Open","High","Low","Close","Volume"]].copy()
     indicators = calculate_indicators(data)
     result = generate_signal(indicators, decision)
-
-    debug = {
-        "symbol": symbol,
-        "decision_requested": decision,
-        "data_source": source,
-        "rows": int(len(df)),
-        "last_date": df["Date"].iloc[-1].strftime("%Y-%m-%d") if "Date" in df.columns else None,
-    }
 
     resp = {
         "symbol": symbol,
@@ -177,6 +195,11 @@ def analyze(req: AnalysisRequest):
             "OBV_trend": _safe_float(indicators.get("OBV_trend")),
             "RSI": _safe_float(indicators.get("RSI")),
         },
-        "debug": debug,
+        "debug": {
+            "data_source": source,
+            "rows": int(len(df)),
+            "last_date": df["Date"].iloc[-1].strftime("%Y-%m-%d") if "Date" in df.columns else None,
+            "tried": tried
+        }
     }
     return JSONResponse(resp, media_type="application/json; charset=utf-8")
