@@ -1,29 +1,14 @@
-
 # trade_decider_v2.py
-# 매매판별 2.0 (English filename for download)
-# - Implements "최적조합" weighted scoring (CCI, RSI, OBV)
-# - Strength is reported as 0~100%: below min-threshold -> 0%, between min~max -> 1~100%
-# - Keeps generate_signal(indicators, decision) signature for drop-in use
+# Improved decision engine with strong-signal filter
+# - Automatic decision: compares buy_score and sell_score
+# - Weak signals below action threshold are forced to 관망
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from io import StringIO
-from typing import Dict, Optional
-
+from typing import Dict
 import pandas as pd
-import requests
 import ta
-from bs4 import BeautifulSoup
-
-
-# === Constants ===
-KOREA_ETF_CODES = [
-    "069500", "102110", "114800", "117700", "118260", "122630", "139260", "157450",
-    "214980", "219480", "229200", "232080", "233740", "237370", "238720", "251340",
-    "252670", "253150", "263750", "272220", "278530", "292150", "295820", "305720",
-    "307510", "310970", "352560", "364980", "371160", "379800", "394280", "411060",
-    "426410", "438420", "461340"
-]
 
 
 @dataclass
@@ -31,78 +16,10 @@ class OptimalCombo:
     w_cci: float = 0.33
     w_rsi: float = 0.33
     w_obv: float = 0.34
-    buy_min: float = 50.0   # "강매수 임계값"
-    sell_min: float = 90.0  # "강매도 임계값"
-    max_threshold: float = 100.0  # Upper bound for percent mapping
-
-    @classmethod
-    def from_text(cls, text: str) -> "OptimalCombo":
-        # Tolerant parser for the provided "최적 조합.txt" format
-        import re
-        w_cci = 0.33
-        w_rsi = 0.33
-        w_obv = 0.34
-        buy_min = 50.0
-        sell_min = 90.0
-        for line in text.splitlines():
-            s = line.strip()
-            if not s:
-                continue
-            if "CCI" in s and "가중치" in s:
-                m = re.search(r"([0-9]*\.?[0-9]+)", s)
-                if m: w_cci = float(m.group(1))
-            elif "RSI" in s and "가중치" in s:
-                m = re.search(r"([0-9]*\.?[0-9]+)", s)
-                if m: w_rsi = float(m.group(1))
-            elif "OBV" in s and "가중치" in s:
-                m = re.search(r"([0-9]*\.?[0-9]+)", s)
-                if m: w_obv = float(m.group(1))
-            elif "강매수" in s and "임계값" in s:
-                m = re.search(r"([0-9]*\.?[0-9]+)", s)
-                if m: buy_min = float(m.group(1))
-            elif "강매도" in s and "임계값" in s:
-                m = re.search(r"([0-9]*\.?[0-9]+)", s)
-                if m: sell_min = float(m.group(1))
-        return cls(w_cci=w_cci, w_rsi=w_rsi, w_obv=w_obv, buy_min=buy_min, sell_min=sell_min)
-
-
-def load_optimal_combo(file_path: Optional[str] = None) -> OptimalCombo:
-    # Attempts to read the on-disk "최적 조합.txt"; falls back to defaults if missing.
-    if not file_path:
-        file_path = "최적 조합.txt"
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            return OptimalCombo.from_text(f.read())
-    except Exception:
-        return OptimalCombo()
-
-
-# === Data & Indicators ===
-def get_naver_etf_price(code: str, pages: int = 5) -> Optional[pd.DataFrame]:
-    try:
-        if not code.isdigit():
-            return None
-        url = f"https://finance.naver.com/item/sise_day.naver?code={code}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        dfs = []
-        for page in range(1, pages + 1):
-            res = requests.get(f"{url}&page={page}", headers=headers, timeout=10)
-            soup = BeautifulSoup(res.text, "html.parser")
-            table = soup.select_one("table[type='N']")
-            if table is None:
-                continue
-            df = pd.read_html(StringIO(str(table)))[0].dropna()
-            dfs.append(df)
-        if not dfs:
-            return None
-        df_all = pd.concat(dfs, ignore_index=True)
-        df_all.columns = ["Date", "Close", "Change", "Open", "High", "Low", "Volume"]
-        df_all["Date"] = pd.to_datetime(df_all["Date"])
-        df_all = df_all.sort_values("Date")
-        df_all.set_index("Date", inplace=True)
-        return df_all[["Open", "High", "Low", "Close", "Volume"]]
-    except Exception:
-        return None
+    buy_min: float = 30.0
+    sell_min: float = 90.0
+    max_threshold: float = 100.0
+    min_action_strength: int = 20   # strong signal filter
 
 
 def calculate_indicators(data: pd.DataFrame) -> Dict[str, float]:
@@ -124,38 +41,41 @@ def calculate_indicators(data: pd.DataFrame) -> Dict[str, float]:
     return {"CCI": cci, "OBV_trend": obv_trend, "RSI": rsi}
 
 
-# === Normalization helpers (0~100 bullish/bearish scores) ===
 def _clip01(x: float) -> float:
-    return 0.0 if x < 0 else (1.0 if x > 1 else x)
+    if x < 0:
+        return 0.0
+    if x > 1:
+        return 1.0
+    return x
 
 
 def _bullish_components(cci: float, rsi: float, obv_trend: float) -> Dict[str, float]:
-    # Lower CCI and RSI are bullish for "매수" side.
-    cci_bull = _clip01((0.0 - cci) / 200.0) * 100.0          # cci <= -200 -> 100, cci >= 0 -> 0
-    rsi_bull = _clip01((50.0 - rsi) / 20.0) * 100.0          # rsi <= 30 -> 100, rsi >= 50 -> 0
-    obv_bull = 100.0 if obv_trend > 0 else 0.0               # sign-based
+    cci_bull = _clip01((0.0 - cci) / 200.0) * 100.0
+    rsi_bull = _clip01((50.0 - rsi) / 20.0) * 100.0
+    obv_bull = 100.0 if obv_trend > 0 else 0.0
     return {"CCI": cci_bull, "RSI": rsi_bull, "OBV": obv_bull}
 
 
 def _bearish_components(cci: float, rsi: float, obv_trend: float) -> Dict[str, float]:
-    # Higher CCI and RSI are bearish for "매도" side.
-    cci_bear = _clip01(cci / 200.0) * 100.0                  # cci >= +200 -> 100, cci <= 0 -> 0
-    rsi_bear = _clip01((rsi - 50.0) / 20.0) * 100.0          # rsi >= 70 -> 100, rsi <= 50 -> 0
-    obv_bear = 100.0 if obv_trend < 0 else 0.0               # sign-based
+    cci_bear = _clip01(cci / 200.0) * 100.0
+    rsi_bear = _clip01((rsi - 50.0) / 20.0) * 100.0
+    obv_bear = 100.0 if obv_trend < 0 else 0.0
     return {"CCI": cci_bear, "RSI": rsi_bear, "OBV": obv_bear}
 
 
 def _weighted_sum(components: Dict[str, float], combo: OptimalCombo) -> float:
-    return components["CCI"] * combo.w_cci + components["RSI"] * combo.w_rsi + components["OBV"] * combo.w_obv
+    return (
+        components["CCI"] * combo.w_cci
+        + components["RSI"] * combo.w_rsi
+        + components["OBV"] * combo.w_obv
+    )
 
 
 def _percent_from_threshold(score: float, min_thr: float, max_thr: float) -> int:
-    # Below min -> 0%; at min -> 1%; at/above max -> 100%
     if score < min_thr:
         return 0
     if score >= max_thr:
         return 100
-    # Map linearly to 1..100
     return int(1 + (score - min_thr) * 99.0 / (max_thr - min_thr))
 
 
@@ -166,53 +86,22 @@ def _level_from_percent(p: int) -> str:
         return "매우강함"
     if p >= 41:
         return "강함"
-    return "적정"  # 1~40%
+    return "적정"
 
 
 def _color_from_percent(p: int) -> str:
-    # Green-ish when strong, yellow mid, orange low, red when 0%
     if p == 0:
-        return "#F44336"  # red
+        return "#F44336"
     if p >= 71:
-        return "#2E7D32"  # strong green
+        return "#2E7D32"
     if p >= 41:
-        return "#FBC02D"  # amber
-    return "#FB8C00"      # orange
+        return "#FBC02D"
+    return "#FB8C00"
 
 
-def _compact_reason(decision: str, cci: float, rsi: float, obv_trend: float) -> str:
-    # Build compact Korean phrases like "CCI 중립 / OBV 유출 / RSI 중립"
-    if decision == "매수":
-        cci_str = "중립" if cci >= -100 else "과매도"
-        rsi_str = "중립" if rsi >= 30 else "과매도"
-        obv_str = "유입" if obv_trend > 0 else "유출"
-    else:
-        cci_str = "중립" if cci <= 100 else "과매수"
-        rsi_str = "중립" if rsi <= 70 else "과매수"
-        obv_str = "유출" if obv_trend < 0 else "유입"
-    return f"CCI {cci_str} / OBV {obv_str} / RSI {rsi_str}"
+def auto_generate_signal(indicators: Dict[str, float]) -> Dict[str, object]:
+    combo = OptimalCombo()
 
-
-# === Public API ===
-def generate_signal(indicators: Dict[str, float], decision: str) -> Dict[str, object]:
-    """
-    Args:
-        indicators: {"CCI": float, "OBV_trend": float, "RSI": float}
-        decision: "매수" 또는 "매도"
-    Returns:
-        {
-            "recommendation": "매수"/"매도" or "매수X"/"매도X",
-            "score": int,             # raw weighted score (0~100 rounded)
-            "strength_pct": int,      # 0~100% (0 when below min threshold; 1~100 within min~max)
-            "strength": str,          # "85%" (widget-friendly)
-            "color": str,
-            "level": str,             # 적정/강함/매우강함/미달
-            "reason": str,            # compact + newline + (임계값: ~)
-            "components": {...},      # 지표별 0~100 기여도
-            "thresholds": {"min": float, "max": float}
-        }
-    """
-    combo = load_optimal_combo()  # Falls back to defaults if the file is missing.
     cci = float(indicators.get("CCI", 0.0))
     obv_trend = float(indicators.get("OBV_trend", 0.0))
     rsi = float(indicators.get("RSI", 0.0))
@@ -220,39 +109,53 @@ def generate_signal(indicators: Dict[str, float], decision: str) -> Dict[str, ob
     bull = _bullish_components(cci, rsi, obv_trend)
     bear = _bearish_components(cci, rsi, obv_trend)
 
-    buy_score = _weighted_sum(bull, combo)     # 0~100
-    sell_score = _weighted_sum(bear, combo)    # 0~100
+    buy_score = _weighted_sum(bull, combo)
+    sell_score = _weighted_sum(bear, combo)
 
-    if decision == "매수":
-        min_thr = combo.buy_min
-        max_thr = combo.max_threshold
-        strength_pct = _percent_from_threshold(buy_score, min_thr, max_thr)
-        score_to_report = int(round(buy_score))
-        recommendation = "매수" if strength_pct > 0 else "매수X"
-        components = bull
+    buy_strength = _percent_from_threshold(buy_score, combo.buy_min, combo.max_threshold)
+    sell_strength = _percent_from_threshold(sell_score, combo.sell_min, combo.max_threshold)
+
+    if buy_strength == 0 and sell_strength == 0:
+        recommendation = "관망"
+        chosen_score = max(buy_score, sell_score)
+        strength_pct = 0
+        side = "중립"
+        chosen_components = bull if buy_score >= sell_score else bear
+    elif buy_strength >= sell_strength:
+        recommendation = "매수"
+        chosen_score = buy_score
+        strength_pct = buy_strength
+        side = "매수"
+        chosen_components = bull
     else:
-        min_thr = combo.sell_min
-        max_thr = combo.max_threshold
-        strength_pct = _percent_from_threshold(sell_score, min_thr, max_thr)
-        score_to_report = int(round(sell_score))
-        recommendation = "매도" if strength_pct > 0 else "매도X"
-        components = bear
+        recommendation = "매도"
+        chosen_score = sell_score
+        strength_pct = sell_strength
+        side = "매도"
+        chosen_components = bear
 
-    level = _level_from_percent(strength_pct)
-    color = _color_from_percent(strength_pct)
-
-    compact = _compact_reason(decision, cci, rsi, obv_trend)
-    reason = compact + f"\n(임계값: {decision} {min_thr:g} ~ {max_thr:g})"
+    # strong signal filter
+    if recommendation in ("매수", "매도") and strength_pct < combo.min_action_strength:
+        recommendation = "관망"
+        side = "중립"
 
     return {
         "recommendation": recommendation,
-        "score": score_to_report,
+        "decision_side": side,
+        "score": int(round(chosen_score)),
+        "buy_score": round(buy_score, 2),
+        "sell_score": round(sell_score, 2),
         "strength_pct": int(strength_pct),
-        "strength": f"{int(strength_pct)}%",  # widget에서 바로 출력 가능
-        "color": color,
-        "level": level,
-        "reason": reason,  # 줄바꿈 포함
-        "components": {k: int(round(v)) for k, v in components.items()},
-        "thresholds": {"min": float(min_thr), "max": float(max_thr)},
+        "strength": f"{int(strength_pct)}%",
+        "color": _color_from_percent(strength_pct),
+        "level": _level_from_percent(strength_pct),
+        "reason": f"CCI={cci:.2f}, RSI={rsi:.2f}, OBV_trend={obv_trend:.2f}",
+        "components": {k: int(round(v)) for k, v in chosen_components.items()},
+        "thresholds": {
+            "buy_min": combo.buy_min,
+            "sell_min": combo.sell_min,
+            "max": combo.max_threshold,
+            "min_action_strength": combo.min_action_strength,
+        },
         "weights": {"CCI": combo.w_cci, "RSI": combo.w_rsi, "OBV": combo.w_obv},
     }
