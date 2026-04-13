@@ -1,9 +1,9 @@
 fastapi
-uvicorn
-pydantic
+uvicorn[standard]
 pandas
 requests
-beautifulsoup4
-lxml
 ta
 yfinance
+lxml
+html5lib
+beautifulsoup4
