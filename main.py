@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from utils import calculate_indicators, generate_signal
+from utils import calculate_indicators, auto_generate_signal
 
 # === Config ===
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "d2jqag1r01qj8a5kmhigd2jqag1r01qj8a5kmhj0")
@@ -176,7 +176,7 @@ def analyze(req: AnalysisRequest):
 
     data = df[["Open","High","Low","Close","Volume"]].copy()
     indicators = calculate_indicators(data)
-    result = generate_signal(indicators, decision)
+    result = auto_generate_signal(indicators)
 
     resp = {
         "symbol": symbol,
