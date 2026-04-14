@@ -2,7 +2,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from utils_vix_reweighted_checked import calculate_indicators, generate_signal, generate_dual_signal
+# FIXED: import path
+from utils import calculate_indicators, generate_signal, generate_dual_signal
 import traceback
 import requests
 import pandas as pd
@@ -73,9 +74,6 @@ def fetch_from_krx(symbol: str, pages: int = 8):
         return None
 
 def fetch_vix():
-    """
-    FRED VIXCLS 일별 데이터 로드
-    """
     try:
         url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=VIXCLS"
         response = requests.get(url, timeout=10)
