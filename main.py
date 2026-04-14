@@ -1,29 +1,15 @@
-# main_improved.py
-# Improved API using automatic decision logic
-# Run: uvicorn main_improved:app --host 0.0.0.0 --port 5000
-
-# redeploy trigger
-
-from __future__ import annotations
-
-import math
-import os
-import time
-from io import StringIO
-
-import pandas as pd
-import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from utils import calculate_indicators, generate_signal
+import traceback
+import requests
+import pandas as pd
+from io import StringIO
+import math
 
-from trade_decider_v2 import calculate_indicators, auto_generate_signal
-
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
-ALLOW_YAHOO_FALLBACK = os.getenv("ALLOW_YAHOO_FALLBACK", "0") == "1"
-
-app = FastAPI(title="Improved LKBUY2 API")
+app = FastAPI(title="LKBUY2 API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,167 +21,63 @@ app.add_middleware(
 
 class AnalysisRequest(BaseModel):
     symbol: str
+    decision: str
 
+def safe_float(value):
+    return float(value) if value is not None and math.isfinite(value) else 0.0
 
-def _safe_float(x):
+def fetch_from_krx(symbol: str, pages: int = 5):
     try:
-        if x is None:
-            return 0.0
-        v = float(x)
-        return v if math.isfinite(v) else 0.0
-    except Exception:
-        return 0.0
-
-
-def fetch_from_finnhub(symbol: str):
-    try:
-        url = "https://finnhub.io/api/v1/stock/candle"
-        now = int(time.time())
-        past = now - 60 * 60 * 24 * 220
-        params = {
-            "symbol": symbol,
-            "resolution": "D",
-            "from": past,
-            "to": now,
-            "token": FINNHUB_API_KEY,
-        }
-        r = requests.get(url, params=params, timeout=20)
-        data = r.json()
-        if data.get("s") != "ok":
-            return None, f"finnhub_status:{data.get('s')}"
-        df = pd.DataFrame({
-            "Date": pd.to_datetime(data.get("t", []), unit="s"),
-            "Open": data.get("o", []),
-            "High": data.get("h", []),
-            "Low": data.get("l", []),
-            "Close": data.get("c", []),
-            "Volume": data.get("v", []),
-        })
-        if df.empty:
-            return None, "finnhub_empty"
-        df = df.dropna().sort_values("Date").reset_index(drop=True)
-        return df.tail(120), None
-    except Exception as e:
-        return None, f"finnhub_exception:{e}"
-
-
-def fetch_from_yahoo(symbol: str):
-    try:
-        import yfinance as yf
-        tk = yf.Ticker(symbol)
-        df = tk.history(period="6mo", interval="1d", auto_adjust=False)
-        if df is None or df.empty:
-            return None, "yahoo_empty"
-        df = df.rename(columns=str.title)[["Open", "High", "Low", "Close", "Volume"]]
-        df = df.dropna().reset_index(drop=False)
-        if "Date" in df.columns:
-            df = df.sort_values("Date").reset_index(drop=True)
-        return df.tail(120), None
-    except Exception as e:
-        return None, f"yahoo_error:{e}"
-
-
-def fetch_from_krx_naver(code: str, pages: int = 5):
-    try:
-        code = code.zfill(6)
+        symbol = symbol.zfill(6)
         headers = {"User-Agent": "Mozilla/5.0"}
-        dfs = []
+        all_dfs = []
         for page in range(1, pages + 1):
-            url = f"https://finance.naver.com/item/sise_day.naver?code={code}&page={page}"
-            res = requests.get(url, headers=headers, timeout=12)
-            tbls = pd.read_html(StringIO(res.text))
-            if not tbls:
-                continue
-            df = tbls[0]
-            dfs.append(df)
-        if not dfs:
-            return None, "krx_no_tables"
-        df = pd.concat(dfs, ignore_index=True)
-        df = df.dropna().reset_index(drop=True)
-        df = df.rename(columns={
-            "날짜": "Date",
-            "종가": "Close",
-            "고가": "High",
-            "저가": "Low",
-            "거래량": "Volume",
-        })
-        for col in ["Close", "High", "Low", "Volume"]:
-            df[col] = pd.to_numeric(df[col].astype(str).str.replace(",", ""), errors="coerce")
+            url = f"https://finance.naver.com/item/sise_day.nhn?code={symbol}&page={page}"
+            response = requests.get(url, headers=headers)
+            dfs = pd.read_html(StringIO(response.text), header=0)
+            if dfs:
+                all_dfs.append(dfs[0])
+
+        df = pd.concat(all_dfs)
+        df = df.dropna(how="all")
+        df = df.rename(columns={"종가": "Close", "거래량": "Volume", "고가": "High", "저가": "Low"})
+        df["Close"] = df["Close"].astype(str).str.replace(",", "").astype(float)
+        df["Volume"] = df["Volume"].astype(str).str.replace(",", "").astype(float)
+        df["High"] = df["High"].astype(str).str.replace(",", "").astype(float)
+        df["Low"] = df["Low"].astype(str).str.replace(",", "").astype(float)
         df["Open"] = df[["Close", "High", "Low"]].mean(axis=1)
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
-        return df[["Date", "Open", "High", "Low", "Close", "Volume"]].tail(180), None
-    except Exception as e:
-        return None, f"krx_exception:{e}"
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "mode": "automatic", "yahoo_fallback": ALLOW_YAHOO_FALLBACK}
-
+        return df.iloc[::-1].reset_index(drop=True)
+    except Exception:
+        return None
 
 @app.post("/analyze")
-def analyze(req: AnalysisRequest):
-    symbol = (req.symbol or "").strip()
-    if not symbol:
-        return JSONResponse({"error": "symbol required"}, status_code=400)
+def analyze_stock(req: AnalysisRequest, request: Request):
+    try:
+        data = fetch_from_krx(req.symbol)
 
-    df = None
-    source = None
-    tried = []
+        if data is None or data.empty:
+            return JSONResponse(
+                content={"symbol": req.symbol, "message": "검출안됨"},
+                status_code=404
+            )
 
-    if symbol.isdigit() and len(symbol) <= 6:
-        df, err = fetch_from_krx_naver(symbol)
-        source = "krx_naver"
-        if df is None:
-            tried.append({"source": "krx_naver", "error": err})
-    else:
-        df, err = fetch_from_finnhub(symbol)
-        if df is not None:
-            source = "finnhub"
-        else:
-            tried.append({"source": "finnhub", "error": err})
-            if ALLOW_YAHOO_FALLBACK:
-                df, yerr = fetch_from_yahoo(symbol)
-                if df is not None:
-                    source = "yahoo"
-                else:
-                    tried.append({"source": "yahoo", "error": yerr})
+        indicators = calculate_indicators(data)
+        result = generate_signal(indicators, req.decision)
 
-    if df is None or df.empty:
-        return JSONResponse(
-            {"symbol": symbol, "message": "데이터 없음 또는 제공처 제한", "tried": tried},
-            status_code=404,
-        )
+        return {
+            "symbol": req.symbol,
+            "recommendation": result["recommendation"],
+            "conviction_score": safe_float(result["score"]),
+            "strength_level": safe_float(result["strength"]),
+            "color": result["color"],
+            "reason": result["reason"],
+            "indicators": indicators
+        }
 
-    data = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-    indicators = calculate_indicators(data)
-    result = auto_generate_signal(indicators)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
-    resp = {
-        "symbol": symbol,
-        "recommendation": str(result.get("recommendation", "")),
-        "decision_side": str(result.get("decision_side", "")),
-        "conviction_score": _safe_float(result.get("score")),
-        "buy_score": _safe_float(result.get("buy_score")),
-        "sell_score": _safe_float(result.get("sell_score")),
-        "strength_pct": int(result.get("strength_pct", 0)),
-        "strength": str(result.get("strength", "0%")),
-        "level": str(result.get("level", "")),
-        "color": str(result.get("color", "#F44336")),
-        "reason": str(result.get("reason", "")),
-        "thresholds": result.get("thresholds", {}),
-        "weights": result.get("weights", {}),
-        "indicators": {
-            "CCI": _safe_float(indicators.get("CCI")),
-            "OBV_trend": _safe_float(indicators.get("OBV_trend")),
-            "RSI": _safe_float(indicators.get("RSI")),
-        },
-        "debug": {
-            "data_source": source,
-            "rows": int(len(df)),
-            "last_date": df["Date"].iloc[-1].strftime("%Y-%m-%d") if "Date" in df.columns else None,
-            "tried": tried,
-        },
-    }
-    return JSONResponse(resp, media_type="application/json; charset=utf-8")
+@app.get("/")
+def root():
+    return {"message": "LKBUY2 API running"}
