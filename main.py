@@ -110,6 +110,8 @@ def fetch_from_finnhub(symbol: str, lookback_days: int = 400) -> pd.DataFrame | 
         }
 
         response = requests.get(url, params=params, timeout=15)
+        print("FINNHUB STATUS:", response.status_code)
+        print("FINNHUB BODY:", response.text[:500])
         response.raise_for_status()
         payload = response.json()
 
