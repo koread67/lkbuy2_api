@@ -1,18 +1,29 @@
-import pandas as pd
+import math
+from typing import Any
+
 import numpy as np
+import pandas as pd
 
 # =========================
 # Trading Logic 2.0
 # =========================
-RSI_WEIGHT = 0.01
-OBV_WEIGHT = 0.17
-DMI_WEIGHT = 0.82
+# 사용자 입력 조건을 점수화하는 구조
+# - RSI / OBV / DMI 가중치 반영
+# - VIX는 독립 지표가 아니라 필터로 반영
+# - 최종적으로 추천, 점수, 강도, 비중, 사유를 반환
 
-BUY_THRESHOLD = 84
-SELL_THRESHOLD = 110
+RSI_WEIGHT = 17
+OBV_WEIGHT = 33
+DMI_WEIGHT = 40
+
+BUY_THRESHOLD = 81
+SELL_THRESHOLD = 104
 
 VIX_BUY_PENALTY = 15
 VIX_SELL_BONUS = 10
+
+BUY_SCORE_MAX = RSI_WEIGHT + OBV_WEIGHT + DMI_WEIGHT  # 90
+SELL_SCORE_MAX = RSI_WEIGHT + OBV_WEIGHT + DMI_WEIGHT + VIX_SELL_BONUS  # 100
 
 
 def _safe_last(series: pd.Series) -> float:
@@ -23,6 +34,88 @@ def _safe_last(series: pd.Series) -> float:
     if pd.isna(value):
         return float("nan")
     return float(value)
+
+
+def _clean_float(value: Any, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+        if math.isfinite(result):
+            return result
+    except Exception:
+        pass
+    return default
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _to_bool_label(flag: bool) -> str:
+    return "True" if flag else "False"
+
+
+def _build_position_size(strength: float) -> int:
+    """강도에 따른 추천 비중(%)"""
+    if strength <= 0:
+        return 0
+    if strength < 20:
+        return 30
+    if strength < 50:
+        return 50
+    if strength < 80:
+        return 70
+    return 100
+
+
+def _build_reason_text(
+    *,
+    decision: str,
+    rsi_ok: bool,
+    obv_ok: bool,
+    dmi_ok: bool,
+    vix_risk: bool,
+    buy_score: int,
+    sell_score: int,
+    applied_filter: bool,
+) -> str:
+    reasons: list[str] = []
+
+    if decision == "매수":
+        if rsi_ok:
+            reasons.append("RSI 매수")
+        if obv_ok:
+            reasons.append("OBV 매수")
+        if dmi_ok:
+            reasons.append("DMI 매수")
+        if not vix_risk:
+            reasons.append("VIX 안정")
+        elif applied_filter:
+            reasons.append("VIX 위험으로 매수점수 감점")
+        reasons.append(f"매수점수 {buy_score}")
+        reasons.append(f"매도점수 {sell_score}")
+    else:
+        if rsi_ok:
+            reasons.append("RSI 매도")
+        if obv_ok:
+            reasons.append("OBV 매도")
+        if dmi_ok:
+            reasons.append("DMI 매도")
+        if vix_risk:
+            reasons.append("VIX 위험")
+        reasons.append(f"매수점수 {buy_score}")
+        reasons.append(f"매도점수 {sell_score}")
+        if applied_filter:
+            reasons.append("VIX 필터로 매도점수 가점")
+
+    return ", ".join(reasons) if reasons else "판단 근거 부족"
+
+
+def _score_to_strength(score: int, threshold: int, max_score: int) -> int:
+    if score < threshold:
+        return 0
+    denominator = max(max_score - threshold, 1)
+    strength = ((score - threshold) / denominator) * 100
+    return int(round(_clamp(strength, 0, 100)))
 
 
 def calculate_indicators(data: pd.DataFrame) -> dict:
@@ -104,9 +197,7 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
 
 
 def generate_signal(indicators: dict, decision: str) -> dict:
-    """
-    decision: "매수" 또는 "매도"
-    """
+    """decision: '매수' 또는 '매도'"""
     if decision not in ["매수", "매도"]:
         raise ValueError("decision은 '매수' 또는 '매도'여야 합니다.")
 
@@ -122,84 +213,108 @@ def generate_signal(indicators: dict, decision: str) -> dict:
     base_values = [rsi, obv, obv_ma20, obv_trend, plus_di, minus_di]
     if any(pd.isna(v) for v in base_values):
         return {
-            "recommendation": decision + "X",
-            "score": np.nan,
-            "strength": np.nan,
+            "recommendation": "관망",
+            "score": 0,
+            "strength": 0,
+            "position_size": 0,
             "color": "#9E9E9E",
             "reason": "지표 계산 데이터 부족",
         }
 
-    if decision == "매수":
-        rsi_ok = rsi >= 50
-        obv_ok = (obv_trend > 0) and (obv >= obv_ma20)
-        dmi_ok = plus_di > minus_di
+    vix_risk = bool(pd.notna(vix) and pd.notna(vix_5ma) and vix > vix_5ma)
 
-        score = round(
-            rsi_ok * RSI_WEIGHT * 100 +
-            obv_ok * OBV_WEIGHT * 100 +
-            dmi_ok * DMI_WEIGHT * 100
-        )
+    # 사용자가 입력한 매수/매도 조건을 점수화하는 구조
+    buy_rsi_ok = bool(_clean_float(rsi) >= 50)
+    buy_obv_ok = bool(_clean_float(obv_trend) > 0 and _clean_float(obv) >= _clean_float(obv_ma20))
+    buy_dmi_ok = bool(_clean_float(plus_di) > _clean_float(minus_di))
 
-        vix_filter_applied = False
-        if pd.notna(vix) and pd.notna(vix_5ma) and vix > vix_5ma:
-            score -= VIX_BUY_PENALTY
-            vix_filter_applied = True
+    sell_rsi_ok = bool(_clean_float(rsi) <= 50)
+    sell_obv_ok = bool(_clean_float(obv_trend) < 0 and _clean_float(obv) <= _clean_float(obv_ma20))
+    sell_dmi_ok = bool(_clean_float(minus_di) > _clean_float(plus_di))
 
-        threshold = BUY_THRESHOLD
-        matched = sum([rsi_ok, obv_ok, dmi_ok])
+    buy_score = 0
+    if buy_rsi_ok:
+        buy_score += RSI_WEIGHT
+    if buy_obv_ok:
+        buy_score += OBV_WEIGHT
+    if buy_dmi_ok:
+        buy_score += DMI_WEIGHT
 
-        recommendation = "매수" if score >= threshold else "매수X"
-        color = "#2196F3" if recommendation == "매수" else "#9E9E9E"
+    sell_score = 0
+    if sell_rsi_ok:
+        sell_score += RSI_WEIGHT
+    if sell_obv_ok:
+        sell_score += OBV_WEIGHT
+    if sell_dmi_ok:
+        sell_score += DMI_WEIGHT
 
-        return {
-            "recommendation": recommendation,
-            "score": int(score),
-            "strength": round((matched / 3) * 100),
-            "color": color,
-            "reason": (
-                f"RSI:{rsi_ok}, OBV:{obv_ok}, DMI:{dmi_ok}, "
-                f"VIX필터적용:{vix_filter_applied}"
-            ),
-        }
+    buy_filter_applied = False
+    sell_filter_applied = False
+    if vix_risk:
+        buy_score = max(0, buy_score - VIX_BUY_PENALTY)
+        sell_score += VIX_SELL_BONUS
+        buy_filter_applied = True
+        sell_filter_applied = True
 
-    rsi_ok = rsi <= 50
-    obv_ok = (obv_trend < 0) and (obv <= obv_ma20)
-    dmi_ok = minus_di > plus_di
+    buy_strength = _score_to_strength(buy_score, BUY_THRESHOLD, BUY_SCORE_MAX)
+    sell_strength = _score_to_strength(sell_score, SELL_THRESHOLD, SELL_SCORE_MAX)
 
-    score = round(
-        rsi_ok * RSI_WEIGHT * 100 +
-        obv_ok * OBV_WEIGHT * 100 +
-        dmi_ok * DMI_WEIGHT * 100
-    )
+    buy_position = _build_position_size(buy_strength)
+    sell_position = _build_position_size(sell_strength)
 
-    vix_filter_applied = False
-    if pd.notna(vix) and pd.notna(vix_5ma) and vix > vix_5ma:
-        score += VIX_SELL_BONUS
-        vix_filter_applied = True
-
-    threshold = SELL_THRESHOLD
-    matched = sum([rsi_ok, obv_ok, dmi_ok])
-
-    recommendation = "매도" if score >= threshold else "매도X"
-    color = "#F44336" if recommendation == "매도" else "#9E9E9E"
-
-    return {
-        "recommendation": recommendation,
-        "score": int(score),
-        "strength": round((matched / 3) * 100),
-        "color": color,
-        "reason": (
-            f"RSI:{rsi_ok}, OBV:{obv_ok}, DMI:{dmi_ok}, "
-            f"VIX필터적용:{vix_filter_applied}"
+    buy_result = {
+        "recommendation": "매수" if buy_score >= BUY_THRESHOLD else "관망",
+        "score": int(buy_score),
+        "strength": int(buy_strength),
+        "position_size": int(buy_position),
+        "color": "#2196F3" if buy_score >= BUY_THRESHOLD else "#9E9E9E",
+        "reason": _build_reason_text(
+            decision="매수",
+            rsi_ok=buy_rsi_ok,
+            obv_ok=buy_obv_ok,
+            dmi_ok=buy_dmi_ok,
+            vix_risk=vix_risk,
+            buy_score=int(buy_score),
+            sell_score=int(sell_score),
+            applied_filter=buy_filter_applied,
         ),
+        "matched": {
+            "RSI": _to_bool_label(buy_rsi_ok),
+            "OBV": _to_bool_label(buy_obv_ok),
+            "DMI": _to_bool_label(buy_dmi_ok),
+            "VIX_RISK": _to_bool_label(vix_risk),
+        },
     }
+
+    sell_result = {
+        "recommendation": "매도" if sell_score >= SELL_THRESHOLD else "관망",
+        "score": int(sell_score),
+        "strength": int(sell_strength),
+        "position_size": int(sell_position),
+        "color": "#F44336" if sell_score >= SELL_THRESHOLD else "#9E9E9E",
+        "reason": _build_reason_text(
+            decision="매도",
+            rsi_ok=sell_rsi_ok,
+            obv_ok=sell_obv_ok,
+            dmi_ok=sell_dmi_ok,
+            vix_risk=vix_risk,
+            buy_score=int(buy_score),
+            sell_score=int(sell_score),
+            applied_filter=sell_filter_applied,
+        ),
+        "matched": {
+            "RSI": _to_bool_label(sell_rsi_ok),
+            "OBV": _to_bool_label(sell_obv_ok),
+            "DMI": _to_bool_label(sell_dmi_ok),
+            "VIX_RISK": _to_bool_label(vix_risk),
+        },
+    }
+
+    return buy_result if decision == "매수" else sell_result
 
 
 def generate_dual_signal(indicators: dict) -> dict:
-    """
-    매수 / 매도를 동시에 평가해서 더 강한 쪽을 반환.
-    둘 다 기준 미달이면 관망.
-    """
+    """매수/매도를 동시에 평가해서 더 강한 쪽을 반환. 둘 다 기준 미달이면 관망."""
     buy_signal = generate_signal(indicators, "매수")
     sell_signal = generate_signal(indicators, "매도")
 
@@ -207,23 +322,41 @@ def generate_dual_signal(indicators: dict) -> dict:
     sell_ok = sell_signal["recommendation"] == "매도"
 
     if buy_ok and not sell_ok:
-        return {"final_decision": "매수", "buy_signal": buy_signal, "sell_signal": sell_signal}
-
-    if sell_ok and not buy_ok:
-        return {"final_decision": "매도", "buy_signal": buy_signal, "sell_signal": sell_signal}
-
-    if buy_ok and sell_ok:
+        final_decision = "매수"
+    elif sell_ok and not buy_ok:
+        final_decision = "매도"
+    elif buy_ok and sell_ok:
         if buy_signal["score"] > sell_signal["score"]:
-            final = "매수"
+            final_decision = "매수"
         elif sell_signal["score"] > buy_signal["score"]:
-            final = "매도"
+            final_decision = "매도"
+        elif buy_signal["strength"] > sell_signal["strength"]:
+            final_decision = "매수"
+        elif sell_signal["strength"] > buy_signal["strength"]:
+            final_decision = "매도"
         else:
-            if buy_signal["strength"] > sell_signal["strength"]:
-                final = "매수"
-            elif sell_signal["strength"] > buy_signal["strength"]:
-                final = "매도"
-            else:
-                final = "관망"
-        return {"final_decision": final, "buy_signal": buy_signal, "sell_signal": sell_signal}
+            final_decision = "관망"
+    else:
+        final_decision = "관망"
 
-    return {"final_decision": "관망", "buy_signal": buy_signal, "sell_signal": sell_signal}
+    final_position = 0
+    final_reason = "매수/매도 임계값 미달"
+    final_color = "#9E9E9E"
+
+    if final_decision == "매수":
+        final_position = int(buy_signal.get("position_size", 0))
+        final_reason = str(buy_signal.get("reason", ""))
+        final_color = str(buy_signal.get("color", "#2196F3"))
+    elif final_decision == "매도":
+        final_position = int(sell_signal.get("position_size", 0))
+        final_reason = str(sell_signal.get("reason", ""))
+        final_color = str(sell_signal.get("color", "#F44336"))
+
+    return {
+        "final_decision": final_decision,
+        "position_size": final_position,
+        "color": final_color,
+        "reason": final_reason,
+        "buy_signal": buy_signal,
+        "sell_signal": sell_signal,
+    }

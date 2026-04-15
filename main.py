@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from utils import calculate_indicators, generate_signal, generate_dual_signal
+from trade_decision_2_0 import calculate_indicators, generate_signal, generate_dual_signal
 
 app = FastAPI(title="LKBUY2 API")
 
