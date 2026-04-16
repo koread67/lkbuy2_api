@@ -1,7 +1,9 @@
 import math
 import os
+import re
 import traceback
 from io import StringIO
+from urllib.parse import quote
 
 import pandas as pd
 import requests
@@ -23,7 +25,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-NAVER_HEADERS = {"User-Agent": "Mozilla/5.0"}
+NAVER_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://finance.naver.com/",
+}
 FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 
@@ -37,9 +42,165 @@ def safe_float(value):
     return float(value) if value is not None and math.isfinite(value) else 0.0
 
 
+def normalize_symbol(symbol: str) -> str:
+    if symbol is None:
+        return ""
+
+    s = str(symbol).strip().upper()
+    # 해외/국내 혼합 입력용: 영문/숫자/.-:_ 만 유지
+    s = re.sub(r"[^A-Z0-9\.\-:_]", "", s)
+    return s
+
+
+def normalize_search_query(symbol: str) -> str:
+    if symbol is None:
+        return ""
+
+    s = str(symbol).strip()
+    # 네이버 검색용: 한글, 영문, 숫자, 공백, 괄호, .-_:+ 허용
+    s = re.sub(r"[^0-9A-Za-z가-힣\s\-\._\(\):+]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def is_krx_symbol(symbol: str) -> bool:
-    s = symbol.strip()
-    return s.isdigit() and len(s) <= 6
+    s = str(symbol).strip()
+    return s.isdigit() and len(s) == 6
+
+
+def extract_6digit_code(symbol: str) -> str | None:
+    if symbol is None:
+        return None
+
+    raw = str(symbol).strip().upper()
+
+    # 1) 정확한 6자리 숫자
+    exact = re.search(r"(?<!\d)(\d{6})(?!\d)", raw)
+    if exact:
+        return exact.group(1)
+
+    # 2) 숫자만 남겼을 때 6자리
+    digits = re.sub(r"[^0-9]", "", raw)
+    if len(digits) == 6:
+        return digits
+
+    # 3) 앞/뒤에 시장 접미가 붙은 형태 (005930KS, KRX005930 등)
+    m = re.search(r"(\d{6})", raw)
+    if m:
+        return m.group(1)
+
+    return None
+
+
+KRX_CONFUSABLE_CHAR_MAP = {
+    "O": "0",
+    "Q": "0",
+    "D": "0",
+    "I": "1",
+    "L": "1",
+    "Z": "2",
+    "S": "5",
+    "B": "8",
+    "G": "6",
+}
+
+
+def extract_krx_candidates(symbol: str) -> list[str]:
+    """
+    국내 종목코드 후보를 넓게 생성.
+    예:
+    - 005930.KS -> 005930
+    - KRX:005930 -> 005930
+    - 0026E0 -> 002660 처럼 혼동 문자 보정 후보 생성
+    """
+    if symbol is None:
+        return []
+
+    raw = str(symbol).strip().upper()
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(candidate: str | None):
+        if candidate and re.fullmatch(r"\d{6}", candidate) and candidate not in seen:
+            seen.add(candidate)
+            candidates.append(candidate)
+
+    # 1) 기존 규칙 기반 직접 추출
+    add(extract_6digit_code(raw))
+
+    # 2) 숫자만 남겼을 때 5~6자리면 0패딩도 고려
+    digits_only = re.sub(r"[^0-9]", "", raw)
+    if len(digits_only) == 6:
+        add(digits_only)
+    elif len(digits_only) == 5:
+        add(digits_only.zfill(6))
+
+    # 3) 영문 혼합형에 대해 혼동문자 치환 후 숫자화
+    translated_chars = []
+    for ch in raw:
+        if ch.isdigit():
+            translated_chars.append(ch)
+        elif ch in KRX_CONFUSABLE_CHAR_MAP:
+            translated_chars.append(KRX_CONFUSABLE_CHAR_MAP[ch])
+    translated_digits = "".join(translated_chars)
+
+    if len(translated_digits) == 6:
+        add(translated_digits)
+    elif len(translated_digits) > 6:
+        for i in range(len(translated_digits) - 5):
+            add(translated_digits[i:i+6])
+    elif len(translated_digits) == 5:
+        add(translated_digits.zfill(6))
+
+    # 4) 원문에서 6글자 블록 단위로 잘라 보고 혼동문자 치환
+    compact = re.sub(r"[^A-Z0-9]", "", raw)
+    if len(compact) >= 6:
+        for i in range(len(compact) - 5):
+            block = compact[i:i+6]
+            converted = "".join(ch if ch.isdigit() else KRX_CONFUSABLE_CHAR_MAP.get(ch, "") for ch in block)
+            add(converted if len(converted) == 6 else None)
+
+    return candidates
+
+
+def search_krx_code_from_naver(query: str) -> str | None:
+    """
+    국내 ETF/ETN/레버리지/종목명을 네이버 금융 검색으로 6자리 종목코드로 해석.
+    입력이 영문+숫자 혼합이어도 검색 결과의 code=###### 를 우선 사용.
+    """
+    try:
+        q = normalize_search_query(query)
+        if not q:
+            return None
+
+        # 1차: 네이버 금융 통합검색
+        search_url = f"https://finance.naver.com/search/search.naver?query={quote(q)}"
+        response = requests.get(search_url, headers=NAVER_HEADERS, timeout=10)
+        response.raise_for_status()
+        text = response.text
+
+        codes = re.findall(r"code=(\d{6})", text)
+        if codes:
+            return codes[0]
+
+        # 2차: 모바일 검색 fallback
+        mobile_url = f"https://m.stock.naver.com/search/index?q={quote(q)}"
+        response = requests.get(mobile_url, headers=NAVER_HEADERS, timeout=10)
+        response.raise_for_status()
+        text = response.text
+
+        codes = re.findall(r'"stockCode"\s*:\s*"(\d{6})"', text)
+        if codes:
+            return codes[0]
+
+        codes = re.findall(r"/stock/(\d{6})", text)
+        if codes:
+            return codes[0]
+
+        return None
+    except Exception:
+        return None
+
 
 
 def fetch_from_krx(symbol: str, pages: int = 12) -> pd.DataFrame | None:
@@ -88,6 +249,7 @@ def fetch_from_krx(symbol: str, pages: int = 12) -> pd.DataFrame | None:
         return df[["Date", "Open", "High", "Low", "Close", "Volume"]]
     except Exception:
         return None
+
 
 
 def fetch_from_finnhub(symbol: str, lookback_days: int = 400) -> pd.DataFrame | None:
@@ -139,6 +301,7 @@ def fetch_from_finnhub(symbol: str, lookback_days: int = 400) -> pd.DataFrame | 
         return None
 
 
+
 def normalize_yahoo_df(df: pd.DataFrame) -> pd.DataFrame | None:
     try:
         if df is None or df.empty:
@@ -167,49 +330,93 @@ def normalize_yahoo_df(df: pd.DataFrame) -> pd.DataFrame | None:
         return None
 
 
+
+def build_yahoo_candidates(symbol: str) -> list[str]:
+    symbol = symbol.strip().upper()
+    candidates: list[str] = []
+
+    # 국내 6자리 코드면 한국 suffix 우선
+    code = extract_6digit_code(symbol)
+    if code:
+        candidates.extend([f"{code}.KS", f"{code}.KQ", code])
+
+    # 원문 자체도 시도
+    candidates.append(symbol)
+
+    # 중복 제거
+    deduped = []
+    seen = set()
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            deduped.append(candidate)
+            seen.add(candidate)
+    return deduped
+
+
+
 def fetch_from_yahoo(symbol: str) -> pd.DataFrame | None:
     try:
-        symbol = symbol.strip().upper()
-        candidates = [symbol]
-
-        if is_krx_symbol(symbol):
-            code = symbol.zfill(6)
-            candidates = [f"{code}.KS", f"{code}.KQ", code]
-
-        for candidate in candidates:
+        for candidate in build_yahoo_candidates(symbol):
             df = yf.download(candidate, period="1y", interval="1d", progress=False, auto_adjust=False)
             normalized = normalize_yahoo_df(df)
             if normalized is not None and not normalized.empty:
                 return normalized
-
         return None
     except Exception:
         return None
 
 
-def fetch_stock_data(symbol: str) -> tuple[pd.DataFrame | None, str]:
-    symbol = symbol.strip()
 
-    if is_krx_symbol(symbol):
-        df = fetch_from_krx(symbol)
+def resolve_krx_code(symbol: str) -> str | None:
+    # 1차: 입력값에서 가능한 국내 코드 후보들을 직접 생성
+    for code in extract_krx_candidates(symbol):
+        return code
+
+    # 2차: 네이버 검색으로 국내 종목/ETF/ETN/레버리지 해석
+    return search_krx_code_from_naver(symbol)
+
+
+
+def fetch_stock_data(symbol: str) -> tuple[pd.DataFrame | None, str]:
+    raw_symbol = str(symbol).strip()
+    normalized_symbol = normalize_symbol(raw_symbol)
+
+    if not raw_symbol and not normalized_symbol:
+        return None, "INVALID"
+
+    # 1) 국내 종목/ETF/ETN/레버리지 우선 해석
+    krx_candidates = extract_krx_candidates(raw_symbol)
+    resolved_code = resolve_krx_code(raw_symbol)
+    if resolved_code and resolved_code not in krx_candidates:
+        krx_candidates.append(resolved_code)
+
+    for krx_code in krx_candidates:
+        df = fetch_from_krx(krx_code)
         if df is not None and not df.empty:
             return df, "KRX"
 
-        df = fetch_from_yahoo(symbol)
+        # 네이버 실패 시 야후 한국 suffix 재시도
+        df = fetch_from_yahoo(krx_code)
         if df is not None and not df.empty:
             return df, "YAHOO_KRX"
 
-        return None, "KRX"
+    # 2) 해외/일반 티커 처리
+    if normalized_symbol:
+        df = fetch_from_finnhub(normalized_symbol)
+        if df is not None and not df.empty:
+            return df, "FINNHUB"
 
-    df = fetch_from_finnhub(symbol)
-    if df is not None and not df.empty:
-        return df, "FINNHUB"
+        df = fetch_from_yahoo(normalized_symbol)
+        if df is not None and not df.empty:
+            return df, "YAHOO"
 
-    df = fetch_from_yahoo(symbol)
+    # 3) 마지막으로 원문을 야후 후보군에 넣어서 한 번 더 시도
+    df = fetch_from_yahoo(raw_symbol)
     if df is not None and not df.empty:
-        return df, "YAHOO"
+        return df, "YAHOO_RAW"
 
     return None, "NONE"
+
 
 
 def fetch_vix() -> pd.DataFrame | None:
@@ -225,6 +432,7 @@ def fetch_vix() -> pd.DataFrame | None:
         return vix
     except Exception:
         return None
+
 
 
 def merge_vix(stock_df: pd.DataFrame, vix_df: pd.DataFrame | None) -> pd.DataFrame:
