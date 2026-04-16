@@ -67,6 +67,36 @@ def is_krx_symbol(symbol: str) -> bool:
     s = str(symbol).strip()
     return s.isdigit() and len(s) == 6
 
+def is_possible_domestic_query(symbol: str) -> bool:
+    if symbol is None:
+        return False
+
+    raw = str(symbol).strip()
+    if not raw:
+        return False
+
+    # 6자리 숫자 코드는 물론 국내로 본다
+    if raw.isdigit() and len(raw) == 6:
+        return True
+
+    # 숫자/영문/특수문자가 섞인 6문자 이상 입력도 국내 검색 후보로 허용
+    compact = re.sub(r"[^0-9A-Za-z가-힣]", "", raw)
+    has_digit = bool(re.search(r"\d", raw))
+    has_alpha = bool(re.search(r"[A-Za-z]", raw))
+    has_special = bool(re.search(r"[^0-9A-Za-z가-힣\s]", raw))
+
+    if len(compact) >= 6 and (has_alpha or has_special) and has_digit:
+        return True
+
+    # 국내 ETF/ETN 계열 검색어도 허용
+    upper = raw.upper()
+    keywords = ["ETF", "ETN", "KODEX", "TIGER", "ACE", "KBSTAR", "ARIRANG", "KOSEF", "SOL", "HANARO", "TIMEFOLIO", "PLUS", "RISE"]
+    if any(k in upper for k in keywords):
+        return True
+
+    return False
+
+
 
 def extract_6digit_code(symbol: str) -> str | None:
     if symbol is None:
@@ -384,23 +414,35 @@ def fetch_stock_data(symbol: str) -> tuple[pd.DataFrame | None, str]:
     if not raw_symbol and not normalized_symbol:
         return None, "INVALID"
 
-    # 1) 국내 종목/ETF/ETN/레버리지 우선 해석
-    krx_candidates = extract_krx_candidates(raw_symbol)
-    resolved_code = resolve_krx_code(raw_symbol)
-    if resolved_code and resolved_code not in krx_candidates:
-        krx_candidates.append(resolved_code)
+    # 1) 국내 문자열 검색 우선
+    # 숫자 6자리뿐 아니라 숫자+영문+특수문자 조합 6문자 이상도 국내 검색 대상으로 본다.
+    if is_possible_domestic_query(raw_symbol):
+        resolved_code = search_krx_code_from_naver(raw_symbol)
+        if resolved_code:
+            df = fetch_from_krx(resolved_code)
+            if df is not None and not df.empty:
+                return df, "KRX_SEARCH"
+
+            df = fetch_from_yahoo(resolved_code)
+            if df is not None and not df.empty:
+                return df, "YAHOO_KRX_SEARCH"
+
+    # 2) 명시적인 6자리 코드 또는 코드 내장 입력 처리
+    krx_candidates = []
+    direct_code = extract_6digit_code(raw_symbol)
+    if direct_code:
+        krx_candidates.append(direct_code)
 
     for krx_code in krx_candidates:
         df = fetch_from_krx(krx_code)
         if df is not None and not df.empty:
             return df, "KRX"
 
-        # 네이버 실패 시 야후 한국 suffix 재시도
         df = fetch_from_yahoo(krx_code)
         if df is not None and not df.empty:
             return df, "YAHOO_KRX"
 
-    # 2) 해외/일반 티커 처리
+    # 3) 해외/일반 티커 처리
     if normalized_symbol:
         df = fetch_from_finnhub(normalized_symbol)
         if df is not None and not df.empty:
@@ -410,7 +452,7 @@ def fetch_stock_data(symbol: str) -> tuple[pd.DataFrame | None, str]:
         if df is not None and not df.empty:
             return df, "YAHOO"
 
-    # 3) 마지막으로 원문을 야후 후보군에 넣어서 한 번 더 시도
+    # 4) 마지막으로 원문을 야후 후보군에 넣어서 한 번 더 시도
     df = fetch_from_yahoo(raw_symbol)
     if df is not None and not df.empty:
         return df, "YAHOO_RAW"
