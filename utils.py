@@ -1,3 +1,4 @@
+
 import math
 from typing import Any
 
@@ -5,29 +6,28 @@ import numpy as np
 import pandas as pd
 
 # =========================
-# Trading Logic 2.0
+# Trading Logic 2.2
 # =========================
-# 사용자 입력 조건을 점수화하는 구조
-# - RSI / OBV / DMI 가중치 반영
+# - RSI / OBV / DMI 기본 가중치 유지
 # - VIX는 독립 지표가 아니라 필터로 반영
-# - 최종적으로 추천, 점수, 강도, 비중, 사유를 반환
+# - 상승 추세 추종만 하지 않도록 과열/피로 억제 로직 유지
+# - 매도는 하락 확인형 + 상승 피로 반전형 두 경로로 판정
 
 RSI_WEIGHT = 17
 OBV_WEIGHT = 33
 DMI_WEIGHT = 40
 
 BUY_THRESHOLD = 81
-SELL_THRESHOLD = 104
+SELL_THRESHOLD = 90
 
 VIX_BUY_PENALTY = 15
 VIX_SELL_BONUS = 10
 
 BUY_SCORE_MAX = RSI_WEIGHT + OBV_WEIGHT + DMI_WEIGHT  # 90
-SELL_SCORE_MAX = RSI_WEIGHT + OBV_WEIGHT + DMI_WEIGHT + VIX_SELL_BONUS  # 100
+SELL_SCORE_MAX = 124  # 하락 확인형 또는 상승 피로 반전형 점수 상한
 
 
 def _safe_last(series: pd.Series) -> float:
-    """마지막 값을 float로 반환. 값이 없으면 NaN 반환."""
     if series is None or len(series) == 0:
         return float("nan")
     value = series.iloc[-1]
@@ -55,7 +55,6 @@ def _to_bool_label(flag: bool) -> str:
 
 
 def _build_position_size(strength: float) -> int:
-    """강도에 따른 추천 비중(%)"""
     if strength <= 0:
         return 0
     if strength < 20:
@@ -67,49 +66,6 @@ def _build_position_size(strength: float) -> int:
     return 100
 
 
-def _build_reason_text(
-    *,
-    decision: str,
-    rsi_ok: bool,
-    obv_ok: bool,
-    dmi_ok: bool,
-    vix_risk: bool,
-    buy_score: int,
-    sell_score: int,
-    applied_filter: bool,
-) -> str:
-    reasons: list[str] = []
-
-    if decision == "매수":
-        if rsi_ok:
-            reasons.append("RSI 매수")
-        if obv_ok:
-            reasons.append("OBV 매수")
-        if dmi_ok:
-            reasons.append("DMI 매수")
-        if not vix_risk:
-            reasons.append("VIX 안정")
-        elif applied_filter:
-            reasons.append("VIX 위험으로 매수점수 감점")
-        reasons.append(f"매수점수 {buy_score}")
-        reasons.append(f"매도점수 {sell_score}")
-    else:
-        if rsi_ok:
-            reasons.append("RSI 매도")
-        if obv_ok:
-            reasons.append("OBV 매도")
-        if dmi_ok:
-            reasons.append("DMI 매도")
-        if vix_risk:
-            reasons.append("VIX 위험")
-        reasons.append(f"매수점수 {buy_score}")
-        reasons.append(f"매도점수 {sell_score}")
-        if applied_filter:
-            reasons.append("VIX 필터로 매도점수 가점")
-
-    return ", ".join(reasons) if reasons else "판단 근거 부족"
-
-
 def _score_to_strength(score: int, threshold: int, max_score: int) -> int:
     if score < threshold:
         return 0
@@ -119,11 +75,6 @@ def _score_to_strength(score: int, threshold: int, max_score: int) -> int:
 
 
 def calculate_indicators(data: pd.DataFrame) -> dict:
-    """
-    입력 컬럼
-    - 필수: Close, High, Low, Volume
-    - 선택: VIX
-    """
     required_cols = ["Close", "High", "Low", "Volume"]
     missing = [col for col in required_cols if col not in data.columns]
     if missing:
@@ -136,7 +87,6 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
     low = pd.to_numeric(df["Low"], errors="coerce")
     volume = pd.to_numeric(df["Volume"], errors="coerce")
 
-    # RSI
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -145,12 +95,10 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
 
-    # OBV
     obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
     obv_ma20 = obv.rolling(20).mean()
     obv_trend = obv.diff(7)
 
-    # DMI / ADX
     up_move = high.diff()
     down_move = -low.diff()
 
@@ -175,7 +123,13 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
     dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
     adx = dx.rolling(14).mean()
 
-    # VIX
+    price_ma20 = close.rolling(20).mean()
+    dist20 = ((close / price_ma20) - 1) * 100
+    rsi_delta3 = rsi.diff(3)
+    adx_delta3 = adx.diff(3)
+    close_prev1 = close.shift(1)
+    ma5 = close.rolling(5).mean()
+
     if "VIX" in df.columns:
         vix = pd.to_numeric(df["VIX"], errors="coerce")
         vix_5ma = vix.rolling(5).mean()
@@ -191,13 +145,75 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
         "PLUS_DI": _safe_last(plus_di),
         "MINUS_DI": _safe_last(minus_di),
         "ADX": _safe_last(adx),
+        "PRICE_MA20": _safe_last(price_ma20),
+        "DIST20": _safe_last(dist20),
+        "RSI_DELTA3": _safe_last(rsi_delta3),
+        "ADX_DELTA3": _safe_last(adx_delta3),
+        "CLOSE_PREV1": _safe_last(close_prev1),
+        "MA5": _safe_last(ma5),
+        "CLOSE": _safe_last(close),
         "VIX": _safe_last(vix),
         "VIX_5MA": _safe_last(vix_5ma),
     }
 
 
+def _build_reason_text(
+    *,
+    decision: str,
+    buy_rsi_ok: bool,
+    buy_obv_ok: bool,
+    buy_dmi_ok: bool,
+    overheat_block: bool,
+    sell_rsi_ok: bool,
+    sell_obv_ok: bool,
+    sell_dmi_ok: bool,
+    exit_setup: bool,
+    exit_confirm: bool,
+    exit_flow_weak: bool,
+    exit_trend_cool: bool,
+    vix_risk: bool,
+    buy_score: int,
+    sell_score: int,
+) -> str:
+    reasons: list[str] = []
+
+    if decision == "매수":
+        if buy_rsi_ok:
+            reasons.append("RSI 매수")
+        if buy_obv_ok:
+            reasons.append("OBV 매수")
+        if buy_dmi_ok:
+            reasons.append("DMI 매수")
+        if overheat_block:
+            reasons.append("과열로 매수 억제")
+        if vix_risk:
+            reasons.append("VIX 위험으로 매수 감점")
+        reasons.append(f"매수점수 {buy_score}")
+        reasons.append(f"매도점수 {sell_score}")
+    else:
+        if sell_rsi_ok:
+            reasons.append("RSI 매도")
+        if sell_obv_ok:
+            reasons.append("OBV 매도")
+        if sell_dmi_ok:
+            reasons.append("DMI 매도")
+        if exit_setup:
+            reasons.append("상승 과열")
+        if exit_confirm:
+            reasons.append("가격 둔화")
+        if exit_flow_weak:
+            reasons.append("수급 둔화")
+        if exit_trend_cool:
+            reasons.append("추세 냉각")
+        if vix_risk:
+            reasons.append("VIX 위험")
+        reasons.append(f"매수점수 {buy_score}")
+        reasons.append(f"매도점수 {sell_score}")
+
+    return ", ".join(reasons) if reasons else "판단 근거 부족"
+
+
 def generate_signal(indicators: dict, decision: str) -> dict:
-    """decision: '매수' 또는 '매도'"""
     if decision not in ["매수", "매도"]:
         raise ValueError("decision은 '매수' 또는 '매도'여야 합니다.")
 
@@ -207,10 +223,17 @@ def generate_signal(indicators: dict, decision: str) -> dict:
     obv_trend = indicators.get("OBV_trend", np.nan)
     plus_di = indicators.get("PLUS_DI", np.nan)
     minus_di = indicators.get("MINUS_DI", np.nan)
+    adx = indicators.get("ADX", np.nan)
+    dist20 = indicators.get("DIST20", np.nan)
+    rsi_delta3 = indicators.get("RSI_DELTA3", np.nan)
+    adx_delta3 = indicators.get("ADX_DELTA3", np.nan)
+    close_prev1 = indicators.get("CLOSE_PREV1", np.nan)
+    ma5 = indicators.get("MA5", np.nan)
+    close = indicators.get("CLOSE", np.nan)
     vix = indicators.get("VIX", np.nan)
     vix_5ma = indicators.get("VIX_5MA", np.nan)
 
-    base_values = [rsi, obv, obv_ma20, obv_trend, plus_di, minus_di]
+    base_values = [rsi, obv, obv_ma20, obv_trend, plus_di, minus_di, close]
     if any(pd.isna(v) for v in base_values):
         return {
             "recommendation": "관망",
@@ -223,14 +246,19 @@ def generate_signal(indicators: dict, decision: str) -> dict:
 
     vix_risk = bool(pd.notna(vix) and pd.notna(vix_5ma) and vix > vix_5ma)
 
-    # 사용자가 입력한 매수/매도 조건을 점수화하는 구조
-    buy_rsi_ok = bool(_clean_float(rsi) >= 50)
+    buy_rsi_ok = bool(52 <= _clean_float(rsi) <= 68)
     buy_obv_ok = bool(_clean_float(obv_trend) > 0 and _clean_float(obv) >= _clean_float(obv_ma20))
-    buy_dmi_ok = bool(_clean_float(plus_di) > _clean_float(minus_di))
+    buy_dmi_ok = bool(_clean_float(plus_di) > _clean_float(minus_di) and (pd.isna(adx) or _clean_float(adx) >= 18))
+    overheat_block = bool(_clean_float(rsi) >= 72 or _clean_float(dist20) >= 8)
 
     sell_rsi_ok = bool(_clean_float(rsi) <= 50)
     sell_obv_ok = bool(_clean_float(obv_trend) < 0 and _clean_float(obv) <= _clean_float(obv_ma20))
     sell_dmi_ok = bool(_clean_float(minus_di) > _clean_float(plus_di))
+
+    exit_setup = bool(_clean_float(rsi) >= 70 and _clean_float(dist20) >= 6)
+    exit_confirm = bool(pd.notna(ma5) and _clean_float(close) < _clean_float(ma5) and _clean_float(rsi_delta3) <= -2)
+    exit_flow_weak = bool(_clean_float(obv_trend) <= 0)
+    exit_trend_cool = bool(_clean_float(adx_delta3) <= -1 and _clean_float(adx) >= 22)
 
     buy_score = 0
     if buy_rsi_ok:
@@ -239,25 +267,38 @@ def generate_signal(indicators: dict, decision: str) -> dict:
         buy_score += OBV_WEIGHT
     if buy_dmi_ok:
         buy_score += DMI_WEIGHT
+    if overheat_block:
+        if _clean_float(rsi) >= 72:
+            buy_score = max(0, buy_score - RSI_WEIGHT)
+        if _clean_float(dist20) >= 8:
+            buy_score = max(0, buy_score - OBV_WEIGHT)
 
-    sell_score = 0
+    sell_score_base = 0
     if sell_rsi_ok:
-        sell_score += RSI_WEIGHT
+        sell_score_base += RSI_WEIGHT
     if sell_obv_ok:
-        sell_score += OBV_WEIGHT
+        sell_score_base += OBV_WEIGHT
     if sell_dmi_ok:
-        sell_score += DMI_WEIGHT
+        sell_score_base += DMI_WEIGHT
 
-    buy_filter_applied = False
-    sell_filter_applied = False
+    sell_score_exit = 0
+    if exit_setup:
+        sell_score_exit += 57
+    if exit_confirm:
+        sell_score_exit += 33
+    if exit_flow_weak:
+        sell_score_exit += 17
+    if exit_trend_cool:
+        sell_score_exit += 17
+
+    sell_score = max(sell_score_base, sell_score_exit)
+
     if vix_risk:
         buy_score = max(0, buy_score - VIX_BUY_PENALTY)
         sell_score += VIX_SELL_BONUS
-        buy_filter_applied = True
-        sell_filter_applied = True
 
-    buy_strength = _score_to_strength(buy_score, BUY_THRESHOLD, BUY_SCORE_MAX)
-    sell_strength = _score_to_strength(sell_score, SELL_THRESHOLD, SELL_SCORE_MAX)
+    buy_strength = _score_to_strength(int(buy_score), BUY_THRESHOLD, BUY_SCORE_MAX)
+    sell_strength = _score_to_strength(int(sell_score), SELL_THRESHOLD, SELL_SCORE_MAX)
 
     buy_position = _build_position_size(buy_strength)
     sell_position = _build_position_size(sell_strength)
@@ -270,18 +311,26 @@ def generate_signal(indicators: dict, decision: str) -> dict:
         "color": "#2196F3" if buy_score >= BUY_THRESHOLD else "#9E9E9E",
         "reason": _build_reason_text(
             decision="매수",
-            rsi_ok=buy_rsi_ok,
-            obv_ok=buy_obv_ok,
-            dmi_ok=buy_dmi_ok,
+            buy_rsi_ok=buy_rsi_ok,
+            buy_obv_ok=buy_obv_ok,
+            buy_dmi_ok=buy_dmi_ok,
+            overheat_block=overheat_block,
+            sell_rsi_ok=sell_rsi_ok,
+            sell_obv_ok=sell_obv_ok,
+            sell_dmi_ok=sell_dmi_ok,
+            exit_setup=exit_setup,
+            exit_confirm=exit_confirm,
+            exit_flow_weak=exit_flow_weak,
+            exit_trend_cool=exit_trend_cool,
             vix_risk=vix_risk,
             buy_score=int(buy_score),
             sell_score=int(sell_score),
-            applied_filter=buy_filter_applied,
         ),
         "matched": {
             "RSI": _to_bool_label(buy_rsi_ok),
             "OBV": _to_bool_label(buy_obv_ok),
             "DMI": _to_bool_label(buy_dmi_ok),
+            "OVERHEAT_BLOCK": _to_bool_label(overheat_block),
             "VIX_RISK": _to_bool_label(vix_risk),
         },
     }
@@ -294,18 +343,29 @@ def generate_signal(indicators: dict, decision: str) -> dict:
         "color": "#F44336" if sell_score >= SELL_THRESHOLD else "#9E9E9E",
         "reason": _build_reason_text(
             decision="매도",
-            rsi_ok=sell_rsi_ok,
-            obv_ok=sell_obv_ok,
-            dmi_ok=sell_dmi_ok,
+            buy_rsi_ok=buy_rsi_ok,
+            buy_obv_ok=buy_obv_ok,
+            buy_dmi_ok=buy_dmi_ok,
+            overheat_block=overheat_block,
+            sell_rsi_ok=sell_rsi_ok,
+            sell_obv_ok=sell_obv_ok,
+            sell_dmi_ok=sell_dmi_ok,
+            exit_setup=exit_setup,
+            exit_confirm=exit_confirm,
+            exit_flow_weak=exit_flow_weak,
+            exit_trend_cool=exit_trend_cool,
             vix_risk=vix_risk,
             buy_score=int(buy_score),
             sell_score=int(sell_score),
-            applied_filter=sell_filter_applied,
         ),
         "matched": {
             "RSI": _to_bool_label(sell_rsi_ok),
             "OBV": _to_bool_label(sell_obv_ok),
             "DMI": _to_bool_label(sell_dmi_ok),
+            "EXIT_SETUP": _to_bool_label(exit_setup),
+            "EXIT_CONFIRM": _to_bool_label(exit_confirm),
+            "EXIT_FLOW_WEAK": _to_bool_label(exit_flow_weak),
+            "EXIT_TREND_COOL": _to_bool_label(exit_trend_cool),
             "VIX_RISK": _to_bool_label(vix_risk),
         },
     }
@@ -314,7 +374,6 @@ def generate_signal(indicators: dict, decision: str) -> dict:
 
 
 def generate_dual_signal(indicators: dict) -> dict:
-    """매수/매도를 동시에 평가해서 더 강한 쪽을 반환. 둘 다 기준 미달이면 관망."""
     buy_signal = generate_signal(indicators, "매수")
     sell_signal = generate_signal(indicators, "매도")
 
