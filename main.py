@@ -64,8 +64,8 @@ def normalize_search_query(symbol: str) -> str:
 
 
 def is_krx_symbol(symbol: str) -> bool:
-    s = str(symbol).strip()
-    return s.isdigit() and len(s) == 6
+    s = str(symbol).strip().upper()
+    return re.fullmatch(r"[0-9A-Z]{6,12}", s) is not None
 
 def is_possible_domestic_query(symbol: str) -> bool:
     if symbol is None:
@@ -98,26 +98,26 @@ def is_possible_domestic_query(symbol: str) -> bool:
 
 
 
-def extract_6digit_code(symbol: str) -> str | None:
+def extract_krx_code(symbol: str) -> str | None:
     if symbol is None:
         return None
 
     raw = str(symbol).strip().upper()
 
-    # 1) 정확한 6자리 숫자
-    exact = re.search(r"(?<!\d)(\d{6})(?!\d)", raw)
-    if exact:
-        return exact.group(1)
+    # 1) 영문+숫자 혼합 6~12자리 코드 자체
+    exact_alnum = re.fullmatch(r"[0-9A-Z]{6,12}", raw)
+    if exact_alnum:
+        return raw
 
-    # 2) 숫자만 남겼을 때 6자리
-    digits = re.sub(r"[^0-9]", "", raw)
-    if len(digits) == 6:
-        return digits
-
-    # 3) 앞/뒤에 시장 접미가 붙은 형태 (005930KS, KRX005930 등)
-    m = re.search(r"(\d{6})", raw)
+    # 2) code=XXXXX 형태에서 영문 포함 코드 추출
+    m = re.search(r"code=([0-9A-Z]{6,12})", raw)
     if m:
         return m.group(1)
+
+    # 3) 숫자 6자리 코드
+    exact_num = re.search(r"(?<!\d)(\d{6})(?!\d)", raw)
+    if exact_num:
+        return exact_num.group(1)
 
     return None
 
@@ -156,7 +156,7 @@ def extract_krx_candidates(symbol: str) -> list[str]:
             candidates.append(candidate)
 
     # 1) 기존 규칙 기반 직접 추출
-    add(extract_6digit_code(raw))
+    add(extract_krx_code(raw))
 
     # 2) 숫자만 남겼을 때 5~6자리면 0패딩도 고려
     digits_only = re.sub(r"[^0-9]", "", raw)
@@ -209,7 +209,7 @@ def search_krx_code_from_naver(query: str) -> str | None:
         response.raise_for_status()
         text = response.text
 
-        codes = re.findall(r"code=(\d{6})", text)
+        codes = re.findall(r"code=([0-9A-Z]{6,12})", text)
         if codes:
             return codes[0]
 
@@ -219,11 +219,11 @@ def search_krx_code_from_naver(query: str) -> str | None:
         response.raise_for_status()
         text = response.text
 
-        codes = re.findall(r'"stockCode"\s*:\s*"(\d{6})"', text)
+        codes = re.findall(r'"stockCode"\s*:\s*"([0-9A-Z]{6,12})"', text)
         if codes:
             return codes[0]
 
-        codes = re.findall(r"/stock/(\d{6})", text)
+        codes = re.findall(r"/stock/([0-9A-Z]{6,12})", text)
         if codes:
             return codes[0]
 
@@ -235,7 +235,9 @@ def search_krx_code_from_naver(query: str) -> str | None:
 
 def fetch_from_krx(symbol: str, pages: int = 12) -> pd.DataFrame | None:
     try:
-        symbol = symbol.zfill(6)
+        symbol = str(symbol).strip().upper()
+        if symbol.isdigit():
+            symbol = symbol.zfill(6)
         all_dfs = []
 
         for page in range(1, pages + 1):
@@ -365,10 +367,12 @@ def build_yahoo_candidates(symbol: str) -> list[str]:
     symbol = symbol.strip().upper()
     candidates: list[str] = []
 
-    # 국내 6자리 코드면 한국 suffix 우선
-    code = extract_6digit_code(symbol)
-    if code:
+    # 국내 숫자 6자리 코드면 한국 suffix 우선
+    code = extract_krx_code(symbol)
+    if code and code.isdigit() and len(code) == 6:
         candidates.extend([f"{code}.KS", f"{code}.KQ", code])
+    elif code:
+        candidates.append(code)
 
     # 원문 자체도 시도
     candidates.append(symbol)
@@ -429,7 +433,7 @@ def fetch_stock_data(symbol: str) -> tuple[pd.DataFrame | None, str]:
 
     # 2) 명시적인 6자리 코드 또는 코드 내장 입력 처리
     krx_candidates = []
-    direct_code = extract_6digit_code(raw_symbol)
+    direct_code = extract_krx_code(raw_symbol)
     if direct_code:
         krx_candidates.append(direct_code)
 
