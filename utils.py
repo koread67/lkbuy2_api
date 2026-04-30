@@ -1,440 +1,303 @@
-import math
-from typing import Any
+# -*- coding: utf-8 -*-
+"""
+매매판별 2604 - 상승추격 방지형 판별 로직
 
-import numpy as np
-import pandas as pd
+목적
+- 상승할수록 매수점수가 누적되어 고점 추격매수가 발생하는 문제를 줄입니다.
+- VIX 안정, OBV 개선, DMI 상승추세는 매수에 반영하되,
+  RSI 과열, VIX 과도 안정, ADX 과열 추세, OBV 급등은 매수 감점으로 처리합니다.
+- 매수/매도 점수는 0~100 범위로 산출합니다.
 
-# =========================
-# Trading Logic 2.3
-# =========================
-# - 00통합.xlsx 자동 탐색 결과 반영
-# - 추격형 매수/매도 완화를 위해 '위치 필터'를 독립 점수로 반영
-# - 매수: 최근 20일 고점 대비 -5% 이하에서 전환 신호가 나올 때 우대
-# - 매도: 최근 20일 고점 대비 -1% 이내 또는 상승 피로 구간에서 우대
-# - 기존 앱 연동을 위해 calculate_indicators / generate_signal / generate_dual_signal 구조 유지
+주요 함수
+- judge_trade_2604(row): 단일 행 데이터 판별
+- calculate_scores(...): 지표값 직접 입력 판별
+"""
 
-RSI_WEIGHT = 25
-OBV_WEIGHT = 20
-CCI_WEIGHT = 15
-POSITION_WEIGHT = 40
+from __future__ import annotations
 
-BUY_THRESHOLD = 70
-SELL_THRESHOLD = 65
-
-SCORE_MAX = RSI_WEIGHT + OBV_WEIGHT + CCI_WEIGHT + POSITION_WEIGHT  # 100
-
-BUY_HIGH_DISCOUNT = -5.0      # 최근 20일 고점 대비 -5% 이하
-SELL_HIGH_NEAR = -1.0         # 최근 20일 고점 대비 -1% 이내
-RSI_DELTA_BUY_MIN = 2.0       # RSI 3일 변화율
-OBV_GAP_MIN = 0.5             # OBV와 OBV MA20 간 갭(%)
-
-VIX_BUY_PENALTY = 10
-VIX_SELL_BONUS = 5
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 
-def _safe_last(series: pd.Series) -> float:
-    if series is None or len(series) == 0:
-        return float("nan")
-    value = series.iloc[-1]
-    if pd.isna(value):
-        return float("nan")
-    return float(value)
+@dataclass
+class TradeDecision:
+    buy_score: int
+    sell_score: int
+    decision: str
+    strength: str
+    reason: str
 
 
-def _clean_float(value: Any, default: float = 0.0) -> float:
+def _to_float(value: Any, default: float = 0.0) -> float:
+    """숫자 변환 실패 시 기본값을 반환합니다."""
     try:
-        result = float(value)
-        if math.isfinite(result):
-            return result
+        if value is None:
+            return default
+        if isinstance(value, str) and value.strip() == "":
+            return default
+        return float(value)
     except Exception:
-        pass
-    return default
+        return default
 
 
-def _clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
+def _clamp(value: float, low: int = 0, high: int = 100) -> int:
+    """점수를 0~100 범위로 제한합니다."""
+    return int(max(low, min(high, round(value))))
 
 
-def _to_bool_label(flag: bool) -> str:
-    return "True" if flag else "False"
+def calculate_scores(
+    rsi: Any = 50,
+    obv: Any = 0,
+    obv_ma20: Any = 0,
+    obv_trend: Any = 0,
+    plus_di: Any = 0,
+    minus_di: Any = 0,
+    adx: Any = 0,
+    vix: Any = 20,
+    vix_5ma: Any = 20,
+) -> TradeDecision:
+    """
+    상승추격 방지형 매매 점수를 계산합니다.
 
+    입력값
+    - rsi: RSI 값
+    - obv: OBV 현재값
+    - obv_ma20: OBV 20일 평균
+    - obv_trend: OBV 추세값. 양수면 유입, 음수면 이탈
+    - plus_di: +DI
+    - minus_di: -DI
+    - adx: ADX
+    - vix: VIX 현재값
+    - vix_5ma: VIX 5일 평균
 
-def _build_position_size(strength: float) -> int:
-    if strength <= 0:
-        return 0
-    if strength < 20:
-        return 30
-    if strength < 50:
-        return 50
-    if strength < 80:
-        return 70
-    return 100
+    판별 원칙
+    - 상승 확인 지표: OBV, DMI, VIX 안정
+    - 추격매수 차단 지표: RSI 과열, ADX 과열, VIX 과도 안정, OBV 급등
+    - 매도는 하락 우위, 자금 이탈, VIX 악화, RSI 과열 후 둔화를 중점 반영
+    """
 
+    rsi = _to_float(rsi, 50)
+    obv = _to_float(obv, 0)
+    obv_ma20 = _to_float(obv_ma20, 0)
+    obv_trend = _to_float(obv_trend, 0)
+    plus_di = _to_float(plus_di, 0)
+    minus_di = _to_float(minus_di, 0)
+    adx = _to_float(adx, 0)
+    vix = _to_float(vix, 20)
+    vix_5ma = _to_float(vix_5ma, 20)
 
-def _score_to_strength(score: int, threshold: int, max_score: int = SCORE_MAX) -> int:
-    if score < threshold:
-        return 0
-    denominator = max(max_score - threshold, 1)
-    strength = ((score - threshold) / denominator) * 100
-    return int(round(_clamp(strength, 0, 100)))
+    buy = 0.0
+    sell = 0.0
+    reasons = []
 
-
-def _gap_percent(value: float, base: float) -> float:
-    if pd.isna(value) or pd.isna(base) or abs(_clean_float(base)) < 1e-12:
-        return 0.0
-    return ((_clean_float(value) / _clean_float(base)) - 1.0) * 100.0
-
-
-def calculate_indicators(data: pd.DataFrame) -> dict:
-    required_cols = ["Close", "High", "Low", "Volume"]
-    missing = [col for col in required_cols if col not in data.columns]
-    if missing:
-        raise ValueError(f"필수 컬럼이 없습니다: {missing}")
-
-    df = data.copy()
-
-    close = pd.to_numeric(df["Close"], errors="coerce")
-    high = pd.to_numeric(df["High"], errors="coerce")
-    low = pd.to_numeric(df["Low"], errors="coerce")
-    volume = pd.to_numeric(df["Volume"], errors="coerce")
-
-    # RSI
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-
-    # OBV
-    obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
-    obv_ma20 = obv.rolling(20).mean()
-    obv_trend = obv.diff(7)
-    obv_gap = ((obv / obv_ma20.replace(0, np.nan)) - 1) * 100
-
-    # CCI
-    typical_price = (high + low + close) / 3
-    tp_ma20 = typical_price.rolling(20).mean()
-    mean_dev = (typical_price - tp_ma20).abs().rolling(20).mean()
-    cci = (typical_price - tp_ma20) / (0.015 * mean_dev.replace(0, np.nan))
-    cci_delta3 = cci.diff(3)
-
-    # DMI / ADX: 보조 참고 지표로 유지
-    up_move = high.diff()
-    down_move = -low.diff()
-
-    plus_dm = pd.Series(
-        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
-        index=df.index,
-    )
-    minus_dm = pd.Series(
-        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
-        index=df.index,
-    )
-
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-    atr = tr.rolling(14).mean()
-    plus_di = 100 * (plus_dm.rolling(14).mean() / atr.replace(0, np.nan))
-    minus_di = 100 * (minus_dm.rolling(14).mean() / atr.replace(0, np.nan))
-    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
-    adx = dx.rolling(14).mean()
-    adx_delta3 = adx.diff(3)
-
-    # 위치 필터
-    price_ma20 = close.rolling(20).mean()
-    dist20 = ((close / price_ma20.replace(0, np.nan)) - 1) * 100
-    high20 = high.rolling(20).max()
-    high20_dist = ((close / high20.replace(0, np.nan)) - 1) * 100
-    low20 = low.rolling(20).min()
-    low20_dist = ((close / low20.replace(0, np.nan)) - 1) * 100
-
-    rsi_delta3 = rsi.diff(3)
-    close_prev1 = close.shift(1)
-    ma5 = close.rolling(5).mean()
-
-    if "VIX" in df.columns:
-        vix = pd.to_numeric(df["VIX"], errors="coerce")
-        vix_5ma = vix.rolling(5).mean()
+    # 1) RSI: 중립권은 약한 가점, 과열권은 매수 감점 및 매도 가점
+    if rsi < 30:
+        buy += 18
+        reasons.append("RSI 과매도권: 반등 가능성 반영")
+    elif 30 <= rsi < 45:
+        buy += 8
+        reasons.append("RSI 저중립권: 약한 매수 가점")
+    elif 45 <= rsi <= 58:
+        buy += 5
+        reasons.append("RSI 중립권: 방향성 제한")
+    elif 58 < rsi <= 65:
+        buy += 3
+        sell += 4
+        reasons.append("RSI 상승권: 추격매수 주의")
+    elif 65 < rsi <= 72:
+        buy -= 10
+        sell += 12
+        reasons.append("RSI 과열 접근: 매수 감점")
     else:
-        vix = pd.Series(np.nan, index=df.index)
-        vix_5ma = pd.Series(np.nan, index=df.index)
+        buy -= 20
+        sell += 22
+        reasons.append("RSI 과열권: 고점 추격 위험")
+
+    # 2) OBV: 단순 상승은 매수 가점, 급등은 추격매수 감점
+    obv_gap = obv - obv_ma20
+    obv_gap_ratio = 0.0
+    if abs(obv_ma20) > 1:
+        obv_gap_ratio = obv_gap / abs(obv_ma20)
+
+    if obv > obv_ma20 and obv_trend > 0:
+        buy += 22
+        reasons.append("OBV가 평균 위이고 추세 양수: 자금 유입")
+    elif obv > obv_ma20:
+        buy += 12
+        reasons.append("OBV가 평균 위: 제한적 자금 유입")
+    elif obv < obv_ma20 and obv_trend < 0:
+        sell += 22
+        reasons.append("OBV가 평균 아래이고 추세 음수: 자금 이탈")
+    else:
+        sell += 8
+        reasons.append("OBV가 평균 아래: 매수 신뢰도 약화")
+
+    if obv_gap_ratio > 0.35 and rsi > 60:
+        buy -= 12
+        sell += 8
+        reasons.append("OBV 급등과 RSI 상승 동반: 추격매수 감점")
+
+    # 3) DMI/ADX: 방향성 반영. ADX가 너무 높고 RSI 과열이면 매수 감점
+    di_gap = plus_di - minus_di
+    if di_gap > 8:
+        buy += 20
+        reasons.append("+DI가 -DI보다 우위: 상승 방향성")
+    elif 0 < di_gap <= 8:
+        buy += 10
+        reasons.append("+DI 소폭 우위: 약한 상승 방향성")
+    elif -8 <= di_gap <= 0:
+        sell += 10
+        reasons.append("-DI 소폭 우위: 약한 하락 방향성")
+    else:
+        sell += 20
+        reasons.append("-DI가 +DI보다 우위: 하락 방향성")
+
+    if adx < 18:
+        buy -= 5
+        sell -= 5
+        reasons.append("ADX 낮음: 추세 신뢰도 낮음")
+    elif 18 <= adx <= 30:
+        buy += 6 if di_gap > 0 else 0
+        sell += 6 if di_gap < 0 else 0
+        reasons.append("ADX 정상 추세권: 방향성 신뢰도 보강")
+    elif 30 < adx <= 42:
+        buy += 8 if di_gap > 0 and rsi <= 65 else -6
+        sell += 8 if di_gap < 0 or rsi > 65 else 0
+        reasons.append("ADX 강한 추세권: 과열 여부에 따라 조정")
+    else:
+        buy -= 12 if rsi > 60 else 0
+        sell += 12 if rsi > 60 else 0
+        reasons.append("ADX 과도 상승: 막판 추세 가능성 반영")
+
+    # 4) VIX: 안정은 매수 가점이지만, 과도한 안정은 과열 경고로 전환
+    vix_gap = vix - vix_5ma
+    if vix > vix_5ma + 2:
+        sell += 18
+        reasons.append("VIX가 5일 평균보다 높음: 위험 확대")
+    elif vix_5ma - 2 <= vix <= vix_5ma + 2:
+        buy += 8
+        reasons.append("VIX 안정권: 시장 위험 중립")
+    else:
+        buy += 10
+        reasons.append("VIX가 5일 평균보다 낮음: 위험 완화")
+
+    if vix < 14 and rsi > 60:
+        buy -= 15
+        sell += 10
+        reasons.append("VIX 과도 안정과 RSI 상승 동반: 안도 과열 경고")
+    elif vix < 16 and rsi > 65:
+        buy -= 10
+        sell += 8
+        reasons.append("낮은 VIX와 RSI 과열 접근: 매수 제한")
+
+    # 5) 상승추격 방지 핵심 조건
+    chase_risk = 0
+    if rsi > 65:
+        chase_risk += 1
+    if adx > 30 and di_gap > 0:
+        chase_risk += 1
+    if vix < vix_5ma and vix < 17:
+        chase_risk += 1
+    if obv_gap_ratio > 0.25:
+        chase_risk += 1
+
+    if chase_risk >= 3:
+        buy -= 20
+        sell += 12
+        reasons.append("상승추격 위험 3개 이상 충족: 매수 강도 강제 감점")
+    elif chase_risk == 2:
+        buy -= 10
+        reasons.append("상승추격 위험 2개 충족: 매수 강도 제한")
+
+    buy_score = _clamp(buy)
+    sell_score = _clamp(sell)
+
+    # 최종 판정
+    if buy_score >= 70 and buy_score - sell_score >= 20:
+        decision = "강매수"
+        strength = "3/3"
+    elif buy_score >= 55 and buy_score > sell_score:
+        decision = "매수"
+        strength = "2/3"
+    elif sell_score >= 70 and sell_score - buy_score >= 20:
+        decision = "강매도"
+        strength = "3/3"
+    elif sell_score >= 50 and sell_score >= buy_score:
+        decision = "매도"
+        strength = "2/3"
+    else:
+        decision = "관망"
+        strength = "1/3"
+
+    # 매수와 매도가 동시에 높으면 관망 우선
+    if buy_score >= 50 and sell_score >= 45 and abs(buy_score - sell_score) < 15:
+        decision = "관망"
+        strength = "1/3"
+        reasons.append("매수·매도 점수 동시 상승: 방향성 충돌로 관망")
+
+    return TradeDecision(
+        buy_score=buy_score,
+        sell_score=sell_score,
+        decision=decision,
+        strength=strength,
+        reason=" / ".join(reasons),
+    )
+
+
+def judge_trade_2604(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    엑셀 또는 데이터프레임 한 행을 받아 판별 결과를 반환합니다.
+
+    허용 컬럼명 예시
+    - RSI
+    - OBV
+    - OBV_MA20 또는 OBV MA20
+    - OBV 추세 또는 OBV_TREND
+    - +DI 또는 PLUS_DI
+    - -DI 또는 MINUS_DI
+    - ADX
+    - VIX
+    - VIX 5MA 또는 VIX_5MA
+    """
+
+    def pick(*names: str, default: Any = 0) -> Any:
+        for name in names:
+            if name in row:
+                return row.get(name)
+        return default
+
+    result = calculate_scores(
+        rsi=pick("RSI", default=50),
+        obv=pick("OBV", default=0),
+        obv_ma20=pick("OBV_MA20", "OBV MA20", "OBV_MA", default=0),
+        obv_trend=pick("OBV 추세", "OBV_TREND", "OBV Trend", default=0),
+        plus_di=pick("+DI", "PLUS_DI", "PDI", default=0),
+        minus_di=pick("-DI", "MINUS_DI", "MDI", default=0),
+        adx=pick("ADX", default=0),
+        vix=pick("VIX", default=20),
+        vix_5ma=pick("VIX 5MA", "VIX_5MA", "VIX_MA5", default=20),
+    )
 
     return {
-        "RSI": _safe_last(rsi),
-        "RSI_DELTA3": _safe_last(rsi_delta3),
-        "OBV": _safe_last(obv),
-        "OBV_MA20": _safe_last(obv_ma20),
-        "OBV_trend": _safe_last(obv_trend),
-        "OBV_GAP": _safe_last(obv_gap),
-        "CCI": _safe_last(cci),
-        "CCI_DELTA3": _safe_last(cci_delta3),
-        "PLUS_DI": _safe_last(plus_di),
-        "MINUS_DI": _safe_last(minus_di),
-        "ADX": _safe_last(adx),
-        "ADX_DELTA3": _safe_last(adx_delta3),
-        "PRICE_MA20": _safe_last(price_ma20),
-        "DIST20": _safe_last(dist20),
-        "HIGH20": _safe_last(high20),
-        "HIGH20_DIST": _safe_last(high20_dist),
-        "LOW20": _safe_last(low20),
-        "LOW20_DIST": _safe_last(low20_dist),
-        "CLOSE_PREV1": _safe_last(close_prev1),
-        "MA5": _safe_last(ma5),
-        "CLOSE": _safe_last(close),
-        "VIX": _safe_last(vix),
-        "VIX_5MA": _safe_last(vix_5ma),
+        "판별값": result.decision,
+        "강도": result.strength,
+        "매수점수": result.buy_score,
+        "매도점수": result.sell_score,
+        "판단사유": result.reason,
     }
 
 
-def _build_reason_text(
-    *,
-    decision: str,
-    buy_rsi_ok: bool,
-    buy_obv_ok: bool,
-    buy_cci_ok: bool,
-    buy_position_ok: bool,
-    sell_rsi_ok: bool,
-    sell_obv_ok: bool,
-    sell_cci_ok: bool,
-    sell_position_ok: bool,
-    vix_risk: bool,
-    buy_score: int,
-    sell_score: int,
-) -> str:
-    reasons: list[str] = []
-
-    if decision == "매수":
-        if buy_rsi_ok:
-            reasons.append("RSI 전환")
-        if buy_obv_ok:
-            reasons.append("OBV 수급 개선")
-        if buy_cci_ok:
-            reasons.append("CCI 반등")
-        if buy_position_ok:
-            reasons.append("저위치 매수 허용")
-        if vix_risk:
-            reasons.append("VIX 위험으로 매수 감점")
-    else:
-        if sell_rsi_ok:
-            reasons.append("RSI 둔화")
-        if sell_obv_ok:
-            reasons.append("OBV 수급 약화")
-        if sell_cci_ok:
-            reasons.append("CCI 약화")
-        if sell_position_ok:
-            reasons.append("고위치 매도 허용")
-        if vix_risk:
-            reasons.append("VIX 위험으로 매도 가점")
-
-    reasons.append(f"매수점수 {buy_score}")
-    reasons.append(f"매도점수 {sell_score}")
-    return ", ".join(reasons) if reasons else "판단 근거 부족"
-
-
-def generate_signal(indicators: dict, decision: str) -> dict:
-    if decision not in ["매수", "매도"]:
-        raise ValueError("decision은 '매수' 또는 '매도'여야 합니다.")
-
-    rsi = indicators.get("RSI", np.nan)
-    rsi_delta3 = indicators.get("RSI_DELTA3", np.nan)
-    obv = indicators.get("OBV", np.nan)
-    obv_ma20 = indicators.get("OBV_MA20", np.nan)
-    obv_trend = indicators.get("OBV_trend", np.nan)
-    obv_gap = indicators.get("OBV_GAP", np.nan)
-    cci = indicators.get("CCI", np.nan)
-    cci_delta3 = indicators.get("CCI_DELTA3", np.nan)
-    high20_dist = indicators.get("HIGH20_DIST", np.nan)
-    plus_di = indicators.get("PLUS_DI", np.nan)
-    minus_di = indicators.get("MINUS_DI", np.nan)
-    close = indicators.get("CLOSE", np.nan)
-    vix = indicators.get("VIX", np.nan)
-    vix_5ma = indicators.get("VIX_5MA", np.nan)
-
-    base_values = [rsi, rsi_delta3, obv, obv_ma20, obv_trend, cci, high20_dist, close]
-    if any(pd.isna(v) for v in base_values):
-        return {
-            "recommendation": "관망",
-            "score": 0,
-            "strength": 0,
-            "position_size": 0,
-            "color": "#9E9E9E",
-            "reason": "지표 계산 데이터 부족",
-        }
-
-    rsi_f = _clean_float(rsi)
-    rsi_delta_f = _clean_float(rsi_delta3)
-    obv_f = _clean_float(obv)
-    obv_ma20_f = _clean_float(obv_ma20)
-    obv_trend_f = _clean_float(obv_trend)
-    obv_gap_f = _clean_float(obv_gap, _gap_percent(obv_f, obv_ma20_f))
-    cci_f = _clean_float(cci)
-    cci_delta_f = _clean_float(cci_delta3)
-    high20_dist_f = _clean_float(high20_dist)
-    plus_di_f = _clean_float(plus_di)
-    minus_di_f = _clean_float(minus_di)
-
-    vix_risk = bool(pd.notna(vix) and pd.notna(vix_5ma) and _clean_float(vix) > _clean_float(vix_5ma))
-
-    # 매수: 단순 상승 추격이 아니라 '저위치 + 전환'을 우선한다.
-    buy_rsi_ok = bool(45 <= rsi_f <= 68 and rsi_delta_f >= RSI_DELTA_BUY_MIN)
-    buy_obv_ok = bool(obv_trend_f > 0 and obv_gap_f >= OBV_GAP_MIN)
-    buy_cci_ok = bool(-120 <= cci_f <= 120 and cci_delta_f > 0)
-    buy_position_ok = bool(high20_dist_f <= BUY_HIGH_DISCOUNT)
-
-    # 매도: 하락 추격을 줄이기 위해 고위치/피로 구간을 중심으로 판단한다.
-    sell_rsi_ok = bool((rsi_f >= 60 and rsi_delta_f <= -2) or rsi_f <= 45)
-    sell_obv_ok = bool(obv_trend_f < 0 and obv_gap_f <= -OBV_GAP_MIN)
-    sell_cci_ok = bool((cci_f >= 100 and cci_delta_f < 0) or (cci_f < -100 and cci_delta_f < 0))
-    sell_position_ok = bool(high20_dist_f >= SELL_HIGH_NEAR)
-
-    buy_score = 0
-    if buy_rsi_ok:
-        buy_score += RSI_WEIGHT
-    if buy_obv_ok:
-        buy_score += OBV_WEIGHT
-    if buy_cci_ok:
-        buy_score += CCI_WEIGHT
-    if buy_position_ok:
-        buy_score += POSITION_WEIGHT
-
-    sell_score = 0
-    if sell_rsi_ok:
-        sell_score += RSI_WEIGHT
-    if sell_obv_ok:
-        sell_score += OBV_WEIGHT
-    if sell_cci_ok:
-        sell_score += CCI_WEIGHT
-    if sell_position_ok:
-        sell_score += POSITION_WEIGHT
-
-    # DMI는 독립 점수가 아니라 동점/경계 상황 보정으로만 사용한다.
-    if pd.notna(plus_di) and pd.notna(minus_di):
-        if plus_di_f > minus_di_f and buy_score >= BUY_THRESHOLD - 5:
-            buy_score += 5
-        if minus_di_f > plus_di_f and sell_score >= SELL_THRESHOLD - 5:
-            sell_score += 5
-
-    if vix_risk:
-        buy_score = max(0, buy_score - VIX_BUY_PENALTY)
-        sell_score += VIX_SELL_BONUS
-
-    buy_score = int(_clamp(buy_score, 0, SCORE_MAX))
-    sell_score = int(_clamp(sell_score, 0, SCORE_MAX))
-
-    buy_strength = _score_to_strength(buy_score, BUY_THRESHOLD)
-    sell_strength = _score_to_strength(sell_score, SELL_THRESHOLD)
-    buy_position = _build_position_size(buy_strength)
-    sell_position = _build_position_size(sell_strength)
-
-    buy_result = {
-        "recommendation": "매수" if buy_score >= BUY_THRESHOLD else "관망",
-        "score": buy_score,
-        "strength": int(buy_strength),
-        "position_size": int(buy_position),
-        "color": "#2196F3" if buy_score >= BUY_THRESHOLD else "#9E9E9E",
-        "reason": _build_reason_text(
-            decision="매수",
-            buy_rsi_ok=buy_rsi_ok,
-            buy_obv_ok=buy_obv_ok,
-            buy_cci_ok=buy_cci_ok,
-            buy_position_ok=buy_position_ok,
-            sell_rsi_ok=sell_rsi_ok,
-            sell_obv_ok=sell_obv_ok,
-            sell_cci_ok=sell_cci_ok,
-            sell_position_ok=sell_position_ok,
-            vix_risk=vix_risk,
-            buy_score=buy_score,
-            sell_score=sell_score,
-        ),
-        "matched": {
-            "RSI": _to_bool_label(buy_rsi_ok),
-            "OBV": _to_bool_label(buy_obv_ok),
-            "CCI": _to_bool_label(buy_cci_ok),
-            "POSITION": _to_bool_label(buy_position_ok),
-            "VIX_RISK": _to_bool_label(vix_risk),
-        },
+# 이미지 예시값 테스트
+if __name__ == "__main__":
+    sample = {
+        "RSI": 49.3,
+        "OBV": -247569,
+        "OBV_MA20": -203123,
+        "OBV 추세": -7736,
+        "+DI": 27.9,
+        "-DI": 30.5,
+        "ADX": 16.9,
+        "VIX": 17.8,
+        "VIX 5MA": 18,
     }
-
-    sell_result = {
-        "recommendation": "매도" if sell_score >= SELL_THRESHOLD else "관망",
-        "score": sell_score,
-        "strength": int(sell_strength),
-        "position_size": int(sell_position),
-        "color": "#F44336" if sell_score >= SELL_THRESHOLD else "#9E9E9E",
-        "reason": _build_reason_text(
-            decision="매도",
-            buy_rsi_ok=buy_rsi_ok,
-            buy_obv_ok=buy_obv_ok,
-            buy_cci_ok=buy_cci_ok,
-            buy_position_ok=buy_position_ok,
-            sell_rsi_ok=sell_rsi_ok,
-            sell_obv_ok=sell_obv_ok,
-            sell_cci_ok=sell_cci_ok,
-            sell_position_ok=sell_position_ok,
-            vix_risk=vix_risk,
-            buy_score=buy_score,
-            sell_score=sell_score,
-        ),
-        "matched": {
-            "RSI": _to_bool_label(sell_rsi_ok),
-            "OBV": _to_bool_label(sell_obv_ok),
-            "CCI": _to_bool_label(sell_cci_ok),
-            "POSITION": _to_bool_label(sell_position_ok),
-            "VIX_RISK": _to_bool_label(vix_risk),
-        },
-    }
-
-    return buy_result if decision == "매수" else sell_result
-
-
-def generate_dual_signal(indicators: dict) -> dict:
-    buy_signal = generate_signal(indicators, "매수")
-    sell_signal = generate_signal(indicators, "매도")
-
-    buy_ok = buy_signal["recommendation"] == "매수"
-    sell_ok = sell_signal["recommendation"] == "매도"
-
-    if buy_ok and not sell_ok:
-        final_decision = "매수"
-    elif sell_ok and not buy_ok:
-        final_decision = "매도"
-    elif buy_ok and sell_ok:
-        if buy_signal["score"] > sell_signal["score"]:
-            final_decision = "매수"
-        elif sell_signal["score"] > buy_signal["score"]:
-            final_decision = "매도"
-        elif buy_signal["strength"] > sell_signal["strength"]:
-            final_decision = "매수"
-        elif sell_signal["strength"] > buy_signal["strength"]:
-            final_decision = "매도"
-        else:
-            final_decision = "관망"
-    else:
-        final_decision = "관망"
-
-    final_position = 0
-    final_reason = "매수/매도 임계값 미달"
-    final_color = "#9E9E9E"
-
-    if final_decision == "매수":
-        final_position = int(buy_signal.get("position_size", 0))
-        final_reason = str(buy_signal.get("reason", ""))
-        final_color = str(buy_signal.get("color", "#2196F3"))
-    elif final_decision == "매도":
-        final_position = int(sell_signal.get("position_size", 0))
-        final_reason = str(sell_signal.get("reason", ""))
-        final_color = str(sell_signal.get("color", "#F44336"))
-
-    return {
-        "final_decision": final_decision,
-        "position_size": final_position,
-        "color": final_color,
-        "reason": final_reason,
-        "buy_signal": buy_signal,
-        "sell_signal": sell_signal,
-    }
+    print(judge_trade_2604(sample))
